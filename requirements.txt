@@ -4,3 +4,5 @@ aiohttp
 nest_asyncio
 dnspython
 certifi
+pytz
+apscheduler
