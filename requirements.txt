@@ -1,0 +1,5 @@
+python-telegram-bot
+motor
+aiohttp
+nest_asyncio
+dnspython
