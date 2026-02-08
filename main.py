@@ -4,6 +4,9 @@ import os
 import uuid
 from datetime import datetime, timedelta
 
+# --- CRITICAL FIX: Import certifi for SSL ---
+import certifi
+
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
@@ -32,7 +35,9 @@ logger = logging.getLogger(__name__)
 # ================= MONGODB MANAGER =================
 class Database:
     def __init__(self, uri):
-        self.client = AsyncIOMotorClient(uri)
+        # --- CRITICAL FIX: Add tlsCAFile=certifi.where() ---
+        # This forces the connection to trust MongoDB's SSL certificates on Render
+        self.client = AsyncIOMotorClient(uri, tlsCAFile=certifi.where())
         self.db = self.client['telegram_bot_db']
         
         # Collections
@@ -88,8 +93,12 @@ async def run_web_server():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    
+    # --- CRITICAL FIX: Use Render's PORT or default to 8080 ---
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    logger.info(f"Web server started on port {port}")
 
 # ================= HELPER FUNCTIONS =================
 async def auto_delete_job(context: ContextTypes.DEFAULT_TYPE):
