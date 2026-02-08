@@ -46,14 +46,12 @@ class Database:
             {'$set': {'name': name, 'username': username, 'last_active': datetime.now()}}, 
             upsert=True
         )
-        # Update admin activity if it is admin
         if user_id == ADMIN_ID:
             await self.settings.update_one({'_id': 'admin_status'}, {'$set': {'last_seen': datetime.now()}}, upsert=True)
 
     async def is_admin_online(self):
         doc = await self.settings.find_one({'_id': 'admin_status'})
         if not doc: return False
-        # Online if active in last 10 mins
         return (datetime.now() - doc['last_seen']).total_seconds() < 600
 
     async def get_stats(self):
@@ -108,8 +106,7 @@ def parse_link(link):
 # ================= ADMIN PANEL =================
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    # Update admin last seen
-    await db.add_user(ADMIN_ID, "Admin", "Admin")
+    await db.add_user(ADMIN_ID, "Admin", "Admin") # Keep online status
     
     kb = [
         [InlineKeyboardButton("➕ Add Content", callback_data="menu_add"), InlineKeyboardButton("📢 Broadcast", callback_data="menu_cast")],
@@ -118,7 +115,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("<b>🛡️ ADMIN PANEL</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
-# ================= 1. ADD CONTENT (INSTANT) =================
+# ================= 1. ADD CONTENT (INSTANT MODE) =================
 async def menu_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -134,7 +131,7 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = msg.text or msg.caption or ""
     uid = str(uuid.uuid4())[:8]
 
-    # A. Batch (Fast)
+    # A. BATCH (INSTANT)
     if txt.lower().startswith("batch"):
         try:
             parts = txt.split()
@@ -142,7 +139,7 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c2, m2 = parse_link(parts[2])
             if c1 != c2: raise ValueError
             
-            # Save directly to DB (Instant)
+            # Save IDs immediately (No verification = 0.1s delay)
             await db.save_content(uid, 'batch', c1, m1, end_id=m2)
             
             link = f"https://t.me/{context.bot.username}?start={uid}"
@@ -152,19 +149,17 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Error. Format: `Batch Link1 Link2`")
             return ConversationHandler.END
 
-    # B. Single Link
+    # B. SINGLE LINK (INSTANT)
     c_id, m_id = parse_link(txt)
     if c_id:
-        # Save directly (Verify on delivery to be faster here, or verify async)
-        # We verify lightly to ensure ID is correct
+        # Save IDs immediately
         await db.save_content(uid, 'single', c_id, m_id)
         link = f"https://t.me/{context.bot.username}?start={uid}"
         await update.message.reply_text(f"✅ <b>Link Saved!</b>\n\n{link}", parse_mode=ParseMode.HTML)
         return ConversationHandler.END
 
-    # C. File Forward
+    # C. FILE FORWARD (INSTANT)
     src = msg.chat_id
-    # If forwarded from channel, try to keep source, else use current chat
     if msg.forward_from_chat: src = msg.forward_from_chat.id
         
     await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption)
@@ -172,11 +167,11 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ <b>File Saved!</b>\n\n{link}", parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
-# ================= 2. SETTINGS (WITH DELETE) =================
+# ================= 2. SETTINGS (DELETE LINKS) =================
 # --- Update Channel ---
 async def menu_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     curr = await db.get_setting('upd_link')
-    text = f"Current Link: {curr}" if curr else "No link set."
+    text = f"Current: {curr}" if curr else "No link set."
     
     kb = []
     if curr: kb.append([InlineKeyboardButton("🗑️ Delete Link", callback_data="del_upd_link")])
@@ -205,8 +200,8 @@ async def del_force_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.clear_force_channels()
     await db.set_setting('f_ph', None)
     await db.set_setting('f_txt', None)
-    await update.callback_query.answer("🗑️ All Force Links Deleted!")
-    await update.callback_query.edit_message_text("✅ Cleared. Send Photo to start fresh.")
+    await update.callback_query.answer("🗑️ Cleared!")
+    await update.callback_query.edit_message_text("✅ All Force Links Deleted. Send Photo to start fresh.")
     return ADD_FORCE_MEDIA
 
 async def save_force_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -323,32 +318,40 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await db.add_user(uid, user.first_name, user.username)
     
-    # === PATH 1: USER CLICKED A FILE LINK ===
+    # 1. DEEP LINK? (Check content immediately)
     if context.args:
         context.user_data['pending_content'] = context.args[0]
-        # Skip standard welcome, go straight to join check
         await check_join_status(update, context, uid)
         return
 
-    # === PATH 2: STANDARD START ===
+    # 2. NORMAL START (Show Welcome)
     w_txt = await db.get_setting('w_txt') or "Welcome!"
     w_ph = await db.get_setting('w_ph')
     upd_link = await db.get_setting('upd_link')
     
     kb = []
-    # Only two buttons as requested
     if upd_link: kb.append([InlineKeyboardButton("🔔 Update Channel", url=upd_link)])
     kb.append([InlineKeyboardButton("🆘 Support Chat", callback_data="start_support")])
     
     markup = InlineKeyboardMarkup(kb)
-    if w_ph: await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=markup)
-    else: await update.message.reply_text(w_txt, reply_markup=markup)
+    
+    # Send Welcome Msg
+    msg = None
+    if w_ph:
+        msg = await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=markup)
+    else:
+        msg = await update.message.reply_text(w_txt, reply_markup=markup)
+        
+    # Auto-Delete after 15s (Cleanup)
+    context.job_queue.run_once(del_msg, 15, data={'c': uid, 'm': msg.message_id})
 
 async def check_join_status(update, context, uid):
+    # Logic: Content Requested -> Check Force Join -> Deliver
+    
     # Check if there are Force Join Channels
     channels = await db.get_force_channels()
     
-    # If Channels exist, Show Join List
+    # IF CHANNELS EXIST -> Show Join List
     if channels:
         f_txt = await db.get_setting('f_txt') or "Join these channels to access files:"
         f_ph = await db.get_setting('f_ph')
@@ -357,31 +360,31 @@ async def check_join_status(update, context, uid):
         for ch in channels:
             kb.append([InlineKeyboardButton(ch['name'], url=ch['link'])])
         
-        # Verify Button
+        # Verify Button (This deletes the message and checks)
         kb.append([InlineKeyboardButton("✅ Verify & Get File", callback_data="verify_access")])
         
-        # Show Force Join Msg
         if f_ph:
-            msg = await context.bot.send_photo(uid, f_ph, caption=f_txt, reply_markup=InlineKeyboardMarkup(kb))
+            if update.callback_query:
+                await update.callback_query.message.reply_photo(f_ph, caption=f_txt, reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                await update.message.reply_photo(f_ph, caption=f_txt, reply_markup=InlineKeyboardMarkup(kb))
         else:
-            msg = await context.bot.send_message(uid, f_txt, reply_markup=InlineKeyboardMarkup(kb))
-            
-        # Store message ID to delete later
-        context.user_data['force_msg_id'] = msg.message_id
+            if update.callback_query:
+                await update.callback_query.message.reply_text(f_txt, reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                await update.message.reply_text(f_txt, reply_markup=InlineKeyboardMarkup(kb))
         return
 
-    # If no channels, deliver content immediately
+    # IF NO CHANNELS -> Deliver
     await deliver_content(update, context, uid)
 
 async def verify_access_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # User clicked "Verify"
     query = update.callback_query
     
-    # Delete the Force Join Message (Vanish)
+    # VANISH: Delete the Force Join message when verified
     try: await query.message.delete()
     except: pass
     
-    # Deliver content
     await deliver_content(update, context, update.effective_user.id)
 
 async def deliver_content(update, context, uid):
@@ -407,21 +410,20 @@ async def deliver_content(update, context, uid):
                 try:
                     m = await context.bot.copy_message(uid, data['source_chat'], i)
                     msgs.append(m.message_id)
-                    await asyncio.sleep(0.05) # Tiny delay to prevent flood
+                    await asyncio.sleep(0.05)
                 except: pass
         
         # 30 Min Auto-Delete
         info = await context.bot.send_message(uid, "⚠️ <b>Files auto-delete in 30 mins.</b>", parse_mode=ParseMode.HTML)
         msgs.append(info.message_id)
         
-        # Schedule deletion
         for m_id in msgs:
             context.job_queue.run_once(del_msg, 1800, data={'c': uid, 'm': m_id})
             
     except Exception as e:
         await context.bot.send_message(uid, f"❌ <b>Error:</b> Bot cannot access the file.\nMake sure Bot is Admin in the Source Channel.", parse_mode=ParseMode.HTML)
 
-# ================= SUPPORT SYSTEM (CONTACT REQ) =================
+# ================= SUPPORT SYSTEM =================
 async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await db.support.update_one({'_id': uid}, {'$set': {'active': True}}, upsert=True)
@@ -430,7 +432,7 @@ async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_online = await db.is_admin_online()
     status = "🟢 <b>Admin is Online</b>" if is_online else "🔴 <b>Admin is Offline</b> (Will reply ASAP)"
     
-    # Request Contact Button
+    # Request Contact
     kb_contact = [[KeyboardButton("📱 Share Contact", request_contact=True)]]
     await context.bot.send_message(uid, "👇 <b>Please Share your Contact</b> so Admin can help you better.", reply_markup=ReplyKeyboardMarkup(kb_contact, one_time_keyboard=True), parse_mode=ParseMode.HTML)
     
@@ -443,8 +445,6 @@ async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     contact = update.message.contact
-    
-    # Send Contact to Admin
     await context.bot.send_message(
         ADMIN_ID, 
         f"👤 <b>User Info</b>\nName: {contact.first_name}\nID: <code>{uid}</code>\nPhone: <code>{contact.phone_number}</code>", 
@@ -461,7 +461,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await db.add_user(ADMIN_ID, "Admin", "Admin") # Update activity
         if msg.reply_to_message and "ID:" in (msg.reply_to_message.text or ""):
             try:
-                # Parse ID from "User Info" message format or standard tag
                 txt = msg.reply_to_message.text
                 if "ID:" in txt:
                     tgt = int(txt.split("ID: ")[1].split("\n")[0])
@@ -475,7 +474,6 @@ async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sess and sess.get('active'):
         if msg.video: return await msg.reply_text("❌ No Videos Allowed.")
         
-        # Forward to Admin with End Button
         kb = [[InlineKeyboardButton("End Chat", callback_data=f"end_chat_admin_{uid}")]]
         await context.bot.copy_message(
             ADMIN_ID, uid, msg.message_id, 
