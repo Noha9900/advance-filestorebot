@@ -151,13 +151,12 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"❌ Error: {e}")
         return ConversationHandler.END
 
-    # File Forward
-    if msg.forward_from_chat or msg.chat_id:
-        src = msg.forward_from_chat.id if msg.forward_from_chat else msg.chat_id
-        await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption)
-        link = f"https://t.me/{context.bot.username}?start={uid}"
-        await update.message.reply_text(f"✅ File Saved: <code>{link}</code>", parse_mode=ParseMode.HTML)
-        return ConversationHandler.END
+    # File Forward (Fix for v21: use msg.chat_id as source)
+    src = msg.chat_id
+    await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption)
+    link = f"https://t.me/{context.bot.username}?start={uid}"
+    await update.message.reply_text(f"✅ File Saved: <code>{link}</code>", parse_mode=ParseMode.HTML)
+    return ConversationHandler.END
 
 # ================= 2. BROADCAST =================
 async def menu_cast(update: Update, context: ContextTypes.DEFAULT_TYPE):
