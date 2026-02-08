@@ -68,6 +68,14 @@ class Database:
             '_id': unique_id, 'type': 'single', 'source_chat': source_chat,
             'msg_id': msg_id, 'caption': caption
         })
+    
+    # --- Force Join Channels ---
+    async def add_channel(self, chat_id, link):
+        await self.channels.update_one({'_id': chat_id}, {'$set': {'link': link}}, upsert=True)
+
+    async def get_channels(self):
+        cursor = self.channels.find({})
+        return [{'id': ch['_id'], 'link': ch['link']} async for ch in cursor]
 
 db = None
 
@@ -161,8 +169,6 @@ async def menu_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return BROADCAST_MSG
 
 async def get_broadcast_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Copy message to a temp storage ID (or just keep object in memory if small, but DB is safer)
-    # For simplicity, we assume immediate processing or keeping in context
     context.user_data['broadcast_msg'] = update.message
     await update.message.reply_text(
         "<b>Add Buttons?</b>\nSend buttons in format:\n`Name - Link`\n`Name2 - Link2`\n\nType /skip to send without buttons.", 
@@ -263,15 +269,8 @@ async def handle_support_msg(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # 1. Check if it's Admin replying
     if user_id == ADMIN_ID:
         if msg.reply_to_message:
-            # Need to extract original user ID from the forwarded/alert message
-            # This is complex without storing message mapping.
-            # Simplified: Admin should use /reply <id> <msg> OR we rely on topic/quote.
-            # Robust way: 
-            try:
-                # We assume Admin replies to a message forwarded by bot which has User ID in it?
-                # Actually, easier:
-                pass
-            except: pass
+            # Simplified admin reply logic handled in admin_reply function
+            pass
         return
 
     # 2. Check if User has active session
@@ -293,8 +292,6 @@ async def admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     # Usage: Reply to a forwarded message with text
     if update.message.reply_to_message:
-        # We try to extract ID from the helper text we sent "Message from 12345"
-        # This requires the admin to reply to the TEXT notification, not the forwarded photo
         reply_to = update.message.reply_to_message
         if "Message from" in reply_to.text:
             try:
@@ -336,12 +333,32 @@ async def menu_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADD_CHANNEL_LINK
 
 async def add_channel_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # 1. Clean the input text
+    text = update.message.text.strip()
+    
+    # 2. Split by any whitespace
+    parts = text.split()
+    
+    # 3. Check Format explicitly
+    if len(parts) != 2:
+        await update.message.reply_text(
+            f"❌ <b>Format Error</b>\n\n"
+            f"I detected <b>{len(parts)}</b> parts instead of 2.\n"
+            f"Please send ONLY: `ID Link`\n"
+            f"You sent: `{text}`",
+            parse_mode=ParseMode.HTML
+        )
+        return ConversationHandler.END
+
+    cid, link = parts
+    
+    # 4. Try Database Save with Specific Error Reporting
     try:
-        cid, link = update.message.text.split()
         await db.add_channel(cid, link)
-        await update.message.reply_text("✅ Channel Added.")
-    except:
-        await update.message.reply_text("Error. Format: ID Link")
+        await update.message.reply_text(f"✅ <b>Channel Added Successfully!</b>\nID: {cid}\nLink: {link}", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"❌ <b>System Error:</b>\n`{str(e)}`", parse_mode=ParseMode.HTML)
+    
     return ConversationHandler.END
 
 # ================= USER HANDLERS =================
@@ -389,7 +406,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     markup = InlineKeyboardMarkup(kb)
     
     if media:
-        # Send Media
         try:
             msg = await update.message.reply_photo(media, caption=text, reply_markup=markup, parse_mode=ParseMode.HTML)
         except:
@@ -411,14 +427,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if data['type'] == 'single':
                 await context.bot.copy_message(chat_id=user_id, from_chat_id=data['source_chat'], message_id=data['msg_id'], caption=data['caption'])
             elif data['type'] == 'batch':
-                # Batch Delivery
                 start = data['start_id']
                 end = data['end_id']
                 await update.message.reply_text(f"📂 <b>Sending Batch ({end-start+1} files)...</b>", parse_mode=ParseMode.HTML)
                 for i in range(start, end + 1):
                     try:
                         await context.bot.copy_message(chat_id=user_id, from_chat_id=data['source_chat'], message_id=i)
-                        await asyncio.sleep(0.05) # Prevent flood
+                        await asyncio.sleep(0.05)
                     except: pass
                 await update.message.reply_text("✅ Batch Delivered.")
 
