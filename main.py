@@ -33,7 +33,6 @@ class Database:
     def __init__(self, uri):
         self.client = AsyncIOMotorClient(uri, tlsCAFile=certifi.where())
         self.db = self.client['ultra_bot_db']
-        
         self.users = self.db.users
         self.content = self.db.content
         self.settings = self.db.settings
@@ -42,147 +41,101 @@ class Database:
         self.support = self.db.support_sessions
 
     async def add_user(self, user_id, name, username):
-        await self.users.update_one(
-            {'_id': user_id}, 
-            {'$set': {'name': name, 'username': username, 'last_active': datetime.now()}}, 
-            upsert=True
-        )
+        await self.users.update_one({'_id': user_id}, {'$set': {'name': name, 'username': username}}, upsert=True)
         if user_id == ADMIN_ID:
-            await self.settings.update_one({'_id': 'admin_status'}, {'$set': {'last_seen': datetime.now()}}, upsert=True)
+            await self.settings.update_one({'_id': 'admin_stat'}, {'$set': {'seen': datetime.now()}}, upsert=True)
 
     async def is_admin_online(self):
-        doc = await self.settings.find_one({'_id': 'admin_status'})
+        doc = await self.settings.find_one({'_id': 'admin_stat'})
         if not doc: return False
-        return (datetime.now() - doc['last_seen']).total_seconds() < 600
+        return (datetime.now() - doc['seen']).total_seconds() < 600
 
     async def get_all_users(self):
         cursor = self.users.find({})
         return [doc['_id'] async for doc in cursor]
 
-    async def get_stats(self):
-        return await self.users.count_documents({})
+    async def get_stats(self): return await self.users.count_documents({})
 
-    async def save_content(self, uid, ctype, chat_id, msg_id, end_id=None, caption=""):
-        # We use the UID as the _id for direct retrieval
+    async def save_content(self, uid, ctype, chat_id, msg_id, end_id=None, caption="", file_id=None, file_type=None):
+        # Save file_id for restricted content fallback
         await self.content.insert_one({
-            '_id': uid, 'type': ctype, 'source_chat': chat_id, 
-            'msg_id': msg_id, 'end_id': end_id, 'caption': caption,
-            'time': datetime.now()
+            '_id': uid, 'type': ctype, 'src': chat_id, 'msg': msg_id, 'end': end_id, 
+            'cap': caption, 'fid': file_id, 'ftype': file_type
         })
 
-    async def get_content(self, uid):
-        return await self.content.find_one({'_id': uid})
+    async def get_content(self, uid): return await self.content.find_one({'_id': uid})
+    
+    async def set_setting(self, key, val): await self.settings.update_one({'_id': key}, {'$set': {'v': val}}, upsert=True)
+    async def get_setting(self, key): 
+        d = await self.settings.find_one({'_id': key})
+        return d['v'] if d else None
 
-    async def set_setting(self, key, value):
-        await self.settings.update_one({'_id': key}, {'$set': {'val': value}}, upsert=True)
-
-    async def get_setting(self, key):
-        doc = await self.settings.find_one({'_id': key})
-        return doc['val'] if doc else None
-
-    # --- Force Join ---
-    async def add_force_channel(self, name, link):
-        await self.channels.insert_one({'name': name, 'link': link})
-
-    async def get_force_channels(self):
-        cursor = self.channels.find({})
-        return [{'name': c['name'], 'link': c['link']} async for c in cursor]
-        
-    async def clear_force_channels(self):
-        await self.channels.delete_many({})
-
-    # --- Custom Start Buttons ---
-    async def add_custom_btn(self, name, link):
-        await self.buttons.insert_one({'name': name, 'link': link})
-
-    async def get_custom_btns(self):
-        cursor = self.buttons.find({})
-        return [{'name': b['name'], 'link': b['link']} async for b in cursor]
-
-    async def clear_custom_btns(self):
-        await self.buttons.delete_many({})
+    async def add_force_channel(self, name, link): await self.channels.insert_one({'name': name, 'link': link})
+    async def get_force_channels(self): return [{'name': c['name'], 'link': c['link']} async for c in self.channels.find({})]
+    async def clear_force_channels(self): await self.channels.delete_many({})
+    
+    async def add_custom_btn(self, name, link): await self.buttons.insert_one({'name': name, 'link': link})
+    async def get_custom_btns(self): return [{'name': b['name'], 'link': b['link']} async for b in self.buttons.find({})]
+    async def clear_custom_btns(self): await self.buttons.delete_many({})
 
 db = None
 
-# ================= STATES =================
-(
-    CONTENT_INPUT,
-    BROADCAST_PHOTO, BROADCAST_TEXT, BROADCAST_BUTTONS, BROADCAST_TIME,
-    SET_WEL_MEDIA, SET_WEL_TEXT,
-    ADD_UPD_LINK,
-    ADD_FORCE_MEDIA, ADD_FORCE_TEXT, ADD_FORCE_LINKS,
-    ADD_BTN_TXT 
-) = range(12)
+# ================= HELPER =================
+def build_menu(buttons, n_cols=2, footer_buttons=None):
+    menu = [buttons[i:i + n_cols] for i in range(0, len(buttons), n_cols)]
+    if footer_buttons: menu.append(footer_buttons)
+    return menu
 
-# ================= HELPER FUNCTIONS =================
 def parse_link(link):
-    match = re.search(r't\.me/c/(\d+)/(\d+)', link)
-    if match: return int("-100" + match.group(1)), int(match.group(2))
-    match = re.search(r't\.me/([\w\d_]+)/(\d+)', link)
-    if match: return "@" + match.group(1), int(match.group(2))
+    m = re.search(r't\.me/c/(\d+)/(\d+)', link)
+    if m: return int("-100" + m.group(1)), int(m.group(2))
+    m = re.search(r't\.me/([\w\d_]+)/(\d+)', link)
+    if m: return "@" + m.group(1), int(m.group(2))
     return None, None
 
 def get_channel_id_from_link(link):
     if "t.me/+" in link or "joinchat" in link: return None 
-    match = re.search(r't\.me/([\w\d_]+)', link)
-    if match: return "@" + match.group(1)
+    m = re.search(r't\.me/([\w\d_]+)', link)
+    if m: return "@" + m.group(1)
     return None
 
-def build_menu(buttons, n_cols, header_buttons=None, footer_buttons=None):
-    menu = [buttons[i:i + n_cols] for i in range(0, len(buttons), n_cols)]
-    if header_buttons:
-        menu.insert(0, header_buttons if isinstance(header_buttons, list) else [header_buttons])
-    if footer_buttons:
-        menu.append(footer_buttons if isinstance(footer_buttons, list) else [footer_buttons])
-    return menu
+# ================= STATES =================
+(CONTENT_IN, BC_PHOTO, BC_TEXT, BC_BTNS, BC_TIME, WEL_MEDIA, WEL_TEXT, UPD_LINK, F_MEDIA, F_TEXT, F_LINKS, BTN_TXT) = range(12)
 
-# ================= ADMIN PANEL =================
+# ================= ADMIN =================
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
-    await db.add_user(ADMIN_ID, "Admin", "Admin") 
+    await db.add_user(ADMIN_ID, "Admin", "Admin")
     
-    buttons = [
-        InlineKeyboardButton("➕ Add Content", callback_data="menu_add"), InlineKeyboardButton("📢 Broadcast", callback_data="menu_cast"),
-        InlineKeyboardButton("📝 Set Welcome", callback_data="menu_wel"), InlineKeyboardButton("🔔 Update Channel", callback_data="menu_upd"),
-        InlineKeyboardButton("🛡️ Force Join List", callback_data="menu_force"), InlineKeyboardButton("🔘 Custom Buttons", callback_data="menu_btn"),
+    btns = [
+        InlineKeyboardButton("➕ Add Content", callback_data="m_add"), InlineKeyboardButton("📢 Broadcast", callback_data="m_cast"),
+        InlineKeyboardButton("📝 Welcome", callback_data="m_wel"), InlineKeyboardButton("🔔 Upd Channel", callback_data="m_upd"),
+        InlineKeyboardButton("🛡️ Force Join", callback_data="m_force"), InlineKeyboardButton("🔘 Buttons", callback_data="m_btn"),
         InlineKeyboardButton("📊 Stats", callback_data="stats")
     ]
+    txt = "<b>🛡️ ADMIN DASHBOARD</b>\nSelect an option:"
+    kb = InlineKeyboardMarkup(build_menu(btns, 2))
     
-    msg_text = "<b>🛡️ ADMIN PANEL</b>\nSelect an option:"
-    reply_markup = InlineKeyboardMarkup(build_menu(buttons, n_cols=2))
-    
-    if update.callback_query:
-        await update.callback_query.edit_message_text(msg_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-    else:
-        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
-    
+    if update.callback_query: await update.callback_query.edit_message_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else: await update.message.reply_text(txt, reply_markup=kb, parse_mode=ParseMode.HTML)
     return ConversationHandler.END
 
 async def back_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     return await cmd_admin(update, context)
 
-# ================= 1. ADD CONTENT (FIXED) =================
-async def menu_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await query.edit_message_text(
-        "<b>➕ ADD CONTENT</b>\n\n"
-        "1. <b>Forward File</b> (Recommended)\n"
-        "2. <b>Send Link</b> (Bot must be admin)\n"
-        "3. <b>Batch:</b> `Batch Link1 Link2`",
-        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb)
-    )
-    return CONTENT_INPUT
+# --- ADD CONTENT (FIXED FOR RESTRICTED) ---
+async def m_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("<b>Send File / Link / Batch:</b>\n\n1. Forward any file (Videos/Pics)\n2. Send Link\n3. `Batch Link1 Link2`", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    return CONTENT_IN
 
-async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    txt = msg.text or msg.caption or ""
+async def h_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, txt = update.message, update.message.text or ""
     uid = str(uuid.uuid4())[:8]
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
 
-    # A. BATCH
+    # Batch
     if txt.lower().startswith("batch"):
         try:
             parts = txt.split()
@@ -190,443 +143,367 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c2, m2 = parse_link(parts[2])
             if c1 != c2: raise ValueError
             await db.save_content(uid, 'batch', c1, m1, end_id=m2)
-            link = f"https://t.me/{context.bot.username}?start={uid}"
-            await update.message.reply_text(f"✅ <b>Batch Saved!</b>\n\n{link}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+            await update.message.reply_text(f"Batch: https://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
             return ConversationHandler.END
-        except:
-            await update.message.reply_text("❌ Error. Format: `Batch Link1 Link2`", reply_markup=InlineKeyboardMarkup(kb))
-            return CONTENT_INPUT
+        except: return await update.message.reply_text("Error: `Batch Link1 Link2`", reply_markup=InlineKeyboardMarkup(kb))
 
-    # B. SINGLE LINK
+    # Single Link
     c_id, m_id = parse_link(txt)
     if c_id:
         await db.save_content(uid, 'single', c_id, m_id)
-        link = f"https://t.me/{context.bot.username}?start={uid}"
-        await update.message.reply_text(f"✅ <b>Link Saved!</b>\n\n{link}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        await update.message.reply_text(f"Link: https://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
         return ConversationHandler.END
 
-    # C. FILE FORWARD (FIXED)
-    # We use src = msg.chat_id (Admin's DM) so the bot references the file it already has.
-    if msg.chat_id:
+    # File Forward (Fix: Extract File ID for Restricted Channels)
+    if msg:
+        file_id, file_type = None, None
+        if msg.document: file_id, file_type = msg.document.file_id, "doc"
+        elif msg.video: file_id, file_type = msg.video.file_id, "video"
+        elif msg.photo: file_id, file_type = msg.photo[-1].file_id, "photo"
+        elif msg.audio: file_id, file_type = msg.audio.file_id, "audio"
+        
+        # Save both Source info AND File ID
         src = msg.chat_id 
-        await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption)
-        link = f"https://t.me/{context.bot.username}?start={uid}"
-        await update.message.reply_text(f"✅ <b>File Saved!</b>\n\n{link}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+        await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption, file_id=file_id, file_type=file_type)
+        await update.message.reply_text(f"Link: https://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
         return ConversationHandler.END
 
-# ================= 2. BROADCAST =================
-async def menu_cast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back_home")]]
-    await update.callback_query.edit_message_text("<b>📢 Step 1: Send Photo</b> (or Click Skip).", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return BROADCAST_PHOTO
+# --- BROADCAST (FIXED) ---
+async def m_cast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("<b>Broadcast: Send Photo</b> (or Skip)", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    return BC_PHOTO
 
-async def cast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def h_bc_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Check if skip
     if update.callback_query and update.callback_query.data == "skip":
         context.user_data['bc_photo'] = None
         await update.callback_query.answer()
-    elif update.message and update.message.photo:
-        context.user_data['bc_photo'] = update.message.photo[-1].file_id
     else:
-        context.user_data['bc_photo'] = None
+        context.user_data['bc_photo'] = update.message.photo[-1].file_id if update.message and update.message.photo else None
+    
+    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    txt = "<b>Broadcast: Send Text</b> (or Skip)"
+    
+    # Logic to move to next step regardless of input method
+    if update.message: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    else: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    return BC_TEXT
 
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back_photo")]]
-    msg = await (update.message.reply_text if update.message else update.callback_query.edit_message_text)
-    await msg("<b>📢 Step 2: Send Text</b> (or Click Skip).", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return BROADCAST_TEXT
-
-async def back_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back_home")]]
-    await update.callback_query.edit_message_text("<b>📢 Step 1: Send Photo</b> (or Click Skip).", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return BROADCAST_PHOTO
-
-async def cast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def h_bc_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query and update.callback_query.data == "skip":
         context.user_data['bc_text'] = None
         await update.callback_query.answer()
-    elif update.message and update.message.text:
+    else:
         context.user_data['bc_text'] = update.message.text
     
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back_text")]]
-    msg = await (update.message.reply_text if update.message else update.callback_query.edit_message_text)
-    await msg("<b>📢 Step 3: Send Buttons</b>\nFormat: `Name - Link`\nEx: `Join - https://t.me/join`", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return BROADCAST_BUTTONS
+    kb = [[InlineKeyboardButton("🚀 Send Now", callback_data="now"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    txt = "<b>Ready to Send?</b>"
+    if update.message: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    else: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    return BC_TIME
 
-async def back_to_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back_photo")]]
-    await update.callback_query.edit_message_text("<b>📢 Step 2: Send Text</b> (or Click Skip).", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return BROADCAST_TEXT
-
-async def cast_btns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    layout = []
-    if update.message and update.message.text:
-        try:
-            lines = update.message.text.split('\n')
-            for line in lines:
-                row = []
-                btns = line.split('|')
-                for btn in btns:
-                    name, link = btn.split('-', 1)
-                    row.append(InlineKeyboardButton(name.strip(), url=link.strip()))
-                layout.append(row)
-        except:
-            await update.message.reply_text("❌ Format Error. Use `Name - Link`")
-            return BROADCAST_BUTTONS
-    
-    context.user_data['bc_btns'] = layout
-    kb = [
-        [InlineKeyboardButton("🚀 Send Now", callback_data="now"), InlineKeyboardButton("⏰ Schedule", callback_data="sched")],
-        [InlineKeyboardButton("🔙 Back", callback_data="back_btns")]
-    ]
-    msg = await (update.message.reply_text if update.message else update.callback_query.edit_message_text)
-    await msg("<b>✅ Ready! Send Now or Schedule?</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return BROADCAST_TIME
-
-async def back_to_btns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back_text")]]
-    await update.callback_query.edit_message_text("<b>📢 Step 3: Send Buttons</b>\nFormat: `Name - Link`", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return BROADCAST_BUTTONS
-
-async def cast_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def h_bc_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "now":
         asyncio.create_task(run_broadcast(context))
         await query.edit_message_text("🚀 Broadcasting started...")
         return ConversationHandler.END
-    else:
-        await query.edit_message_text("Send Time (IST): `YYYY-MM-DD HH:MM`", parse_mode=ParseMode.HTML)
-        return BROADCAST_TIME
 
-async def cast_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        t_str = update.message.text
-        loc = IST.localize(datetime.strptime(t_str, "%Y-%m-%d %H:%M"))
-        utc = loc.astimezone(pytz.utc)
-        context.job_queue.run_once(run_scheduled, utc, data=context.user_data.copy())
-        await update.message.reply_text(f"✅ Scheduled: {t_str}")
-    except:
-        await update.message.reply_text("❌ Error format.")
-    return ConversationHandler.END
-
-async def run_broadcast(context, data=None):
-    if not data: data = context.user_data
+async def run_broadcast(context):
+    data = context.user_data
     users = await db.get_all_users()
     photo = data.get('bc_photo')
     text = data.get('bc_text')
-    btns = data.get('bc_btns') 
-    markup = InlineKeyboardMarkup(btns) if btns else None
     
     for uid in users:
         try:
-            if photo: await context.bot.send_photo(uid, photo, caption=text, reply_markup=markup)
-            elif text: await context.bot.send_message(uid, text, reply_markup=markup)
+            if photo: await context.bot.send_photo(uid, photo, caption=text)
+            elif text: await context.bot.send_message(uid, text)
             await asyncio.sleep(0.05)
         except: pass
 
-async def run_scheduled(context: ContextTypes.DEFAULT_TYPE):
-    await run_broadcast(context, context.job.data)
-
-# ================= 3. SETTINGS =================
-# --- Custom Buttons ---
-async def menu_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [
-        [InlineKeyboardButton("🗑️ Delete All Buttons", callback_data="clr_btns")],
-        [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]
-    ]
-    await update.callback_query.edit_message_text("<b>🔘 Add Custom Buttons</b>\n\nSend: `Name - Link`", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
-    return ADD_BTN_TXT
-
-async def save_custom_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    try:
-        name, link = update.message.text.split('-', 1)
-        await db.add_custom_btn(name.strip(), link.strip())
-        await update.message.reply_text("✅ Button Added.", reply_markup=InlineKeyboardMarkup(kb))
-    except:
-        await update.message.reply_text("❌ Error. Use `Name - Link`", reply_markup=InlineKeyboardMarkup(kb))
-    return ConversationHandler.END
-
-async def clear_custom_btns(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await db.clear_custom_btns()
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.callback_query.edit_message_text("🗑️ All Custom Buttons Deleted.", reply_markup=InlineKeyboardMarkup(kb))
-    return ConversationHandler.END
-
-# --- Update Channel ---
-async def menu_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    curr = await db.get_setting('upd_link')
-    text = f"Current: {curr}" if curr else "No link set."
-    kb = [[InlineKeyboardButton("🗑️ Delete Link", callback_data="del_upd_link")], [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.callback_query.edit_message_text(f"{text}\n\nSend new <b>Update Channel Link</b>.", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
-    return ADD_UPD_LINK
-
-async def save_upd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await db.set_setting('upd_link', update.message.text)
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.message.reply_text("✅ Update Link Saved.", reply_markup=InlineKeyboardMarkup(kb))
-    return ConversationHandler.END
-
-async def del_upd_link_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await db.set_setting('upd_link', None)
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.callback_query.edit_message_text("🗑️ Link Deleted.", reply_markup=InlineKeyboardMarkup(kb))
-    return ConversationHandler.END
-
-# --- Force Join ---
-async def menu_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("🗑️ Delete All Links", callback_data="del_force_links")], [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
+# --- FORCE JOIN SETTINGS (FIXED) ---
+async def m_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("🗑️ Delete All Links", callback_data="del_force")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text("Send <b>Force Join Photo</b> (or /cancel).", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
-    return ADD_FORCE_MEDIA
+    return F_MEDIA
 
-async def del_force_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def del_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.clear_force_channels()
     await db.set_setting('f_ph', None)
     await db.set_setting('f_txt', None)
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.callback_query.edit_message_text("🗑️ All Force Links Deleted.", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("🗑️ Deleted.", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-async def save_force_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_f_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['f_ph'] = update.message.photo[-1].file_id
     await update.message.reply_text("Send <b>Force Join Text</b>.")
-    return ADD_FORCE_TEXT
+    return F_TEXT
 
-async def save_force_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_f_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['f_txt'] = update.message.text
     await update.message.reply_text("Send Channels: `Name Link` (One per line).")
-    return ADD_FORCE_LINKS
+    return F_LINKS
 
-async def save_force_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_f_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.clear_force_channels()
     lines = update.message.text.split('\n')
     for line in lines:
         try:
-            n, l = line.rsplit(maxsplit=1)
-            await db.add_force_channel(n, l)
+            parts = line.rsplit(maxsplit=1)
+            if len(parts) == 2:
+                n, l = parts
+                await db.add_force_channel(n, l)
         except: pass
     await db.set_setting('f_ph', context.user_data['f_ph'])
     await db.set_setting('f_txt', context.user_data['f_txt'])
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.message.reply_text("✅ Force Join List Saved.", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.message.reply_text("✅ Saved.", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-# --- Welcome ---
-async def menu_wel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("🗑️ Delete Welcome", callback_data="del_wel")], [InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.callback_query.edit_message_text("Send <b>Welcome Photo</b>.", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
-    return SET_WEL_MEDIA
+# --- UPDATE CHANNEL (Settings) ---
+async def m_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    curr = await db.get_setting('upd_link')
+    txt = f"Current: {curr}" if curr else "None"
+    kb = [[InlineKeyboardButton("🗑️ Delete", callback_data="del_upd")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text(f"{txt}\nSend <b>Update Channel Link</b>.", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
+    return UPD_LINK
 
-async def del_wel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db.set_setting('upd_link', update.message.text)
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.message.reply_text("✅ Saved.", reply_markup=InlineKeyboardMarkup(kb))
+    return ConversationHandler.END
+
+async def del_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db.set_setting('upd_link', None)
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("🗑️ Deleted.", reply_markup=InlineKeyboardMarkup(kb))
+    return ConversationHandler.END
+
+# --- WELCOME SETTINGS ---
+async def m_wel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("🗑️ Delete", callback_data="del_wel")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("Send <b>Welcome Photo</b>.", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
+    return WEL_MEDIA
+
+async def del_wel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.set_setting('w_txt', None)
     await db.set_setting('w_ph', None)
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.callback_query.edit_message_text("🗑️ Welcome Deleted.", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("🗑️ Deleted.", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-async def save_wel_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_w_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['w_ph'] = update.message.photo[-1].file_id
     await update.message.reply_text("Send <b>Welcome Text</b>.")
-    return SET_WEL_TEXT
+    return WEL_TEXT
 
-async def save_wel_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_w_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.set_setting('w_txt', update.message.text)
     await db.set_setting('w_ph', context.user_data['w_ph'])
-    kb = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_home")]]
-    await update.message.reply_text("✅ Welcome Saved.", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.message.reply_text("✅ Saved.", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-# ================= USER FLOW & START =================
+# --- CUSTOM BTNS ---
+async def m_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("🗑️ Clear", callback_data="del_btn")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("Send: `Name - Link`", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
+    return BTN_TXT
+
+async def save_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        n, l = update.message.text.split('-', 1)
+        await db.add_custom_btn(n.strip(), l.strip())
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+        await update.message.reply_text("✅ Added.", reply_markup=InlineKeyboardMarkup(kb))
+    except: await update.message.reply_text("Error: `Name - Link`")
+    return ConversationHandler.END
+
+async def del_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await db.clear_custom_btns()
+    kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("🗑️ Cleared.", reply_markup=InlineKeyboardMarkup(kb))
+    return ConversationHandler.END
+
+async def stats_cb(u, c): await u.callback_query.answer(f"Users: {await db.get_stats()}", show_alert=True)
+
+# ================= START FLOW =================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    user = update.effective_user
-    await db.add_user(uid, user.first_name, user.username)
+    await db.add_user(uid, update.effective_user.first_name, update.effective_user.username)
     
-    # Store deep link payload if present
-    if context.args:
-        context.user_data['pending_content'] = context.args[0]
-
-    # --- CHECK UPDATE CHANNEL STATUS ---
+    if context.args: context.user_data['pl'] = context.args[0]
+    
+    # 1. Update Channel Check
     upd_link = await db.get_setting('upd_link')
     is_member = True
     
     if upd_link:
-        channel_id = get_channel_id_from_link(upd_link)
-        if channel_id:
+        cid = get_channel_id_from_link(upd_link)
+        if cid:
             try:
-                member = await context.bot.get_chat_member(chat_id=channel_id, user_id=uid)
-                if member.status in ['left', 'kicked']: is_member = False
-            except: is_member = False
-        else:
-            if not context.user_data.get('upd_verified'): is_member = False
+                m = await context.bot.get_chat_member(cid, uid)
+                if m.status in ['left', 'kicked']: is_member = False
+            except: is_member = False # Assume not joined if cant check
+        elif not context.user_data.get('upd_verified'): is_member = False
 
-    # 1. SHOW WELCOME (If not joined Update Channel)
     if not is_member and upd_link:
         w_txt = await db.get_setting('w_txt') or "Welcome!"
         w_ph = await db.get_setting('w_ph')
         
-        buttons = []
-        buttons.append(InlineKeyboardButton("🔔 Join Update Channel", url=upd_link))
-        buttons.append(InlineKeyboardButton("✅ I Have Joined", callback_data="verify_upd"))
+        btns = [InlineKeyboardButton("🔔 Join Update Channel", url=upd_link), InlineKeyboardButton("✅ I Have Joined", callback_data="chk_upd")]
+        cust = await db.get_custom_btns()
+        c_btns = [InlineKeyboardButton(b['name'], url=b['link']) for b in cust]
+        footer = [InlineKeyboardButton("🆘 Support Chat", callback_data="supp")]
         
-        custom_btns = await db.get_custom_btns()
-        for btn in custom_btns:
-            buttons.append(InlineKeyboardButton(btn['name'], url=btn['link']))
+        full_kb = build_menu(btns, 2) + build_menu(c_btns, 2) + [footer]
         
-        footer = [InlineKeyboardButton("🆘 Support Chat", callback_data="start_support")]
-        reply_markup = InlineKeyboardMarkup(build_menu(buttons, n_cols=2, footer_buttons=footer))
-        
-        msg = None
-        if w_ph: msg = await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=reply_markup)
-        else: msg = await update.message.reply_text(w_txt, reply_markup=reply_markup)
+        if w_ph: msg = await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=InlineKeyboardMarkup(full_kb))
+        else: msg = await update.message.reply_text(w_txt, reply_markup=InlineKeyboardMarkup(full_kb))
         context.user_data['welcome_msg_id'] = msg.message_id
         return ConversationHandler.END
 
-    # 2. IF JOINED, PROCEED DIRECTLY
     await flow_step_2(update, context)
 
-async def verify_upd_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = update.effective_user.id
-    
-    # Delete Welcome
-    try: await query.message.delete()
-    except: pass
-    
+async def chk_upd_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['upd_verified'] = True
+    try: await update.callback_query.message.delete()
+    except: pass
     await flow_step_2(update, context)
 
 async def flow_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     
-    # 1. SHOW SUPPORT MSG (1 min vanish)
-    kb = [[InlineKeyboardButton("🆘 Contact Admin Now", callback_data="start_support")]]
+    # 1. Support Msg (1 min)
+    kb = [[InlineKeyboardButton("🆘 Contact Admin Now", callback_data="supp")]]
     msg = await context.bot.send_message(uid, "ℹ️ <b>Contact admin now for any query.</b>\n(Disappears in 1 min)", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     context.job_queue.run_once(del_msg, 60, data={'c': uid, 'm': msg.message_id})
     
-    # 2. CHECK FORCE JOIN
+    # 2. Check Force Join
     await check_force_join(update, context)
 
 async def check_force_join(update, context):
     uid = update.effective_user.id
-    
-    # Only if deep link exists
-    if not context.user_data.get('pending_content'): return
+    if not context.user_data.get('pl'): return
 
     channels = await db.get_force_channels()
     if channels:
         f_txt = await db.get_setting('f_txt') or "Join these to access files:"
         f_ph = await db.get_setting('f_ph')
         
-        buttons = []
-        for ch in channels:
-            buttons.append(InlineKeyboardButton(ch['name'], url=ch['link']))
+        btns = [InlineKeyboardButton(c['name'], url=c['link']) for c in channels]
+        footer = [InlineKeyboardButton("✅ Verify & Get File", callback_data="chk_force")]
         
-        footer = [InlineKeyboardButton("✅ Verify & Get File", callback_data="verify_access")]
-        reply_markup = InlineKeyboardMarkup(build_menu(buttons, 2, footer_buttons=footer))
+        markup = InlineKeyboardMarkup(build_menu(btns, 2, footer))
         
-        if f_ph: await context.bot.send_photo(uid, f_ph, caption=f_txt, reply_markup=reply_markup)
-        else: await context.bot.send_message(uid, f_txt, reply_markup=reply_markup)
+        if f_ph: await context.bot.send_photo(uid, f_ph, caption=f_txt, reply_markup=markup)
+        else: await context.bot.send_message(uid, f_txt, reply_markup=markup)
         return
 
-    await deliver_content(update, context, uid)
+    await deliver(update, context)
 
-async def verify_access_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try: await query.message.delete()
+async def chk_force_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: await update.callback_query.message.delete()
     except: pass
-    await deliver_content(update, context, update.effective_user.id)
+    await deliver(update, context)
 
-async def deliver_content(update, context, uid):
-    link_id = context.user_data.get('pending_content')
-    if not link_id: return
-
-    data = await db.get_content(link_id)
+async def deliver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    lid = context.user_data.get('pl')
+    if not lid: return await context.bot.send_message(uid, "✅ <b>Welcome!</b> Use buttons to explore.", parse_mode=ParseMode.HTML)
+    
+    data = await db.get_content(lid)
     if not data: return await context.bot.send_message(uid, "❌ Link Expired.")
-
+    
     try:
         msgs = []
         if data['type'] == 'single':
-            m = await context.bot.copy_message(uid, data['source_chat'], data['msg_id'], caption=data.get('caption',""))
-            msgs.append(m.message_id)
+            # Priority: Try File ID first (Reliable), then Copy Message
+            if data.get('fid'):
+                # Send by File ID
+                ftype = data.get('ftype', 'doc')
+                cap = data.get('cap', "")
+                if ftype == 'video': m = await context.bot.send_video(uid, data['fid'], caption=cap)
+                elif ftype == 'photo': m = await context.bot.send_photo(uid, data['fid'], caption=cap)
+                elif ftype == 'audio': m = await context.bot.send_audio(uid, data['fid'], caption=cap)
+                else: m = await context.bot.send_document(uid, data['fid'], caption=cap)
+                msgs.append(m.message_id)
+            else:
+                # Fallback to copy (Works if bot is admin in src channel)
+                m = await context.bot.copy_message(uid, data['src'], data['msg'], caption=data.get('cap', ""))
+                msgs.append(m.message_id)
+                
         elif data['type'] == 'batch':
-            await context.bot.send_message(uid, f"📂 <b>Batch Found!</b>\nSending {data['end_id'] - data['msg_id'] + 1} files...", parse_mode=ParseMode.HTML)
-            for i in range(data['msg_id'], data['end_id'] + 1):
+            await context.bot.send_message(uid, "📂 <b>Sending Batch...</b>", parse_mode=ParseMode.HTML)
+            for i in range(data['msg'], data['end'] + 1):
                 try:
-                    m = await context.bot.copy_message(uid, data['source_chat'], i)
+                    m = await context.bot.copy_message(uid, data['src'], i)
                     msgs.append(m.message_id)
                     await asyncio.sleep(0.05)
                 except: pass
         
-        info = await context.bot.send_message(uid, "⚠️ <b>Files disappear in 30 mins.</b>\nLink works permanently.", parse_mode=ParseMode.HTML)
+        info = await context.bot.send_message(uid, "⚠️ <b>Files auto-delete in 30 mins.</b>\nLink works permanently.", parse_mode=ParseMode.HTML)
         msgs.append(info.message_id)
         
-        for m_id in msgs: context.job_queue.run_once(del_msg, 1800, data={'c': uid, 'm': m_id})
-    except: await context.bot.send_message(uid, f"❌ <b>Error:</b> Bot cannot access file. Ensure Bot is Admin in source.", parse_mode=ParseMode.HTML)
+        for m in msgs: context.job_queue.run_once(del_msg, 1800, data={'c': uid, 'm': m})
+    except Exception as e: 
+        await context.bot.send_message(uid, f"❌ <b>Error:</b> Bot cannot access file. {e}", parse_mode=ParseMode.HTML)
 
 # ================= SUPPORT =================
-async def start_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_supp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await db.support.update_one({'_id': uid}, {'$set': {'active': True}}, upsert=True)
-    is_online = await db.is_admin_online()
-    status = "🟢 <b>Admin is Online</b>" if is_online else "🔴 <b>Admin is Offline</b>"
+    await db.support.update_one({'_id': uid}, {'$set': {'on': True}}, upsert=True)
     
-    kb_contact = [[KeyboardButton("📱 Share Contact", request_contact=True)]]
-    await context.bot.send_message(uid, "👇 <b>Share Contact</b> for better support.", reply_markup=ReplyKeyboardMarkup(kb_contact, one_time_keyboard=True), parse_mode=ParseMode.HTML)
+    kb = [[InlineKeyboardButton("❌ End Chat", callback_data="end_supp")]]
+    await context.bot.send_message(uid, "✅ <b>Connected to Admin!</b>\nSend Text/Media.\nTap 'End Chat' to close.", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     
-    kb_end = [[InlineKeyboardButton("❌ End Chat", callback_data="end_chat_user")]]
-    await update.callback_query.message.reply_text(f"✅ <b>Connected!</b>\n{status}", reply_markup=InlineKeyboardMarkup(kb_end), parse_mode=ParseMode.HTML)
+    u = update.effective_user
+    # Admin gets text message they can Reply to
+    await context.bot.send_message(ADMIN_ID, f"🚨 <b>Support:</b> {u.first_name} (ID: {uid})", parse_mode=ParseMode.HTML)
 
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    contact = update.message.contact
-    await context.bot.send_message(ADMIN_ID, f"👤 <b>User Info</b>\nName: {contact.first_name}\nID: <code>{uid}</code>\nPhone: <code>{contact.phone_number}</code>", parse_mode=ParseMode.HTML)
-    await update.message.reply_text("✅ Contact Sent.", reply_markup=ReplyKeyboardRemove())
-
-async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     msg = update.message
     
-    # Admin Reply Logic
+    # Admin Reply
     if uid == ADMIN_ID:
-        await db.add_user(ADMIN_ID, "Admin", "Admin") 
         if msg.reply_to_message:
-            original = msg.reply_to_message
-            target_id = None
-            
-            # Logic: Try to find ID in Text or Caption
-            text_to_check = original.text or original.caption or ""
-            if "ID:" in text_to_check:
-                try: target_id = int(re.search(r'ID: (\d+)', text_to_check).group(1))
-                except: pass
-            
-            if target_id:
-                try:
-                    await context.bot.copy_message(target_id, ADMIN_ID, msg.message_id)
+            try:
+                # Basic check for ID in reply text
+                txt = msg.reply_to_message.text or msg.reply_to_message.caption or ""
+                m = re.search(r'ID: (\d+)', txt)
+                if m:
+                    tgt = int(m.group(1))
+                    await context.bot.copy_message(tgt, ADMIN_ID, msg.message_id)
                     await msg.reply_text("✅ Sent.")
-                except: await msg.reply_text("❌ Failed.")
-            else:
-                await msg.reply_text("❌ Could not find User ID. Reply to the user's message.")
+            except: pass
         return
 
-    # User Logic
-    sess = await db.support.find_one({'_id': uid})
-    if sess and sess.get('active'):
-        kb = [[InlineKeyboardButton("End Chat", callback_data=f"end_chat_admin_{uid}")]]
-        # Forward with ID in caption so Admin can reply
-        caption_txt = f"Message from User\n[ID: {uid}]"
+    # User Msg
+    s = await db.support.find_one({'_id': uid})
+    if s and s.get('on'):
+        # Forward user message to Admin with ID in caption so Admin can reply
+        caption_txt = f"Message from User\nID: {uid}"
         if msg.text:
-            await context.bot.send_message(ADMIN_ID, f"{msg.text}\n\n{caption_txt}", reply_markup=InlineKeyboardMarkup(kb))
+            await context.bot.send_message(ADMIN_ID, f"{msg.text}\n\n{caption_txt}")
         else:
-            await context.bot.copy_message(ADMIN_ID, uid, msg.message_id, caption=caption_txt, reply_markup=InlineKeyboardMarkup(kb))
+            await context.bot.copy_message(ADMIN_ID, uid, msg.message_id, caption=caption_txt)
 
-async def end_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def end_supp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     d = update.callback_query.data
-    if "user" in d:
-        await db.support.update_one({'_id': update.effective_user.id}, {'$set': {'active': False}})
+    if d == "end_supp":
+        await db.support.update_one({'_id': update.effective_user.id}, {'$set': {'on': False}})
         await update.callback_query.edit_message_text("❌ Chat Ended.")
+        await context.bot.send_message(ADMIN_ID, f"User {update.effective_user.id} ended chat.")
     else:
-        tgt = int(d.split("_")[-1])
-        await db.support.update_one({'_id': tgt}, {'$set': {'active': False}})
+        # Admin ended
+        tgt = int(d.split("_")[2])
+        await db.support.update_one({'_id': tgt}, {'$set': {'on': False}})
         await update.callback_query.edit_message_text("❌ Ended.")
         await context.bot.send_message(tgt, "❌ Admin ended the chat.")
 
@@ -634,8 +511,7 @@ async def del_msg(context: ContextTypes.DEFAULT_TYPE):
     try: await context.bot.delete_message(context.job.data['c'], context.job.data['m'])
     except: pass
 
-async def stats_cb(u, c):
-    await u.callback_query.answer(f"Users: {await db.get_stats()}", show_alert=True)
+async def stats_cb(u, c): await u.callback_query.answer(f"Users: {await db.get_stats()}", show_alert=True)
 
 # ================= MAIN =================
 def main():
@@ -644,38 +520,49 @@ def main():
     db = Database(MONGO_URL)
     app = Application.builder().token(BOT_TOKEN).build()
     
-    fallback = [CommandHandler("start", cmd_start), CommandHandler("admin", cmd_admin), CallbackQueryHandler(cmd_admin, pattern="back_home")]
+    fallback = [CallbackQueryHandler(back_home, pattern="back"), CommandHandler("admin", cmd_admin), CommandHandler("start", cmd_start)]
 
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_add, pattern="menu_add")], states={CONTENT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_content)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_cast, pattern="menu_cast")], states={
-        BROADCAST_PHOTO: [MessageHandler(filters.ALL & ~filters.COMMAND, cast_photo), CallbackQueryHandler(cast_photo, pattern="skip")],
-        BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cast_text), CallbackQueryHandler(cast_text, pattern="skip"), CallbackQueryHandler(back_to_photo, pattern="back_photo")],
-        BROADCAST_BUTTONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, cast_btns), CallbackQueryHandler(cast_btns, pattern="skip"), CallbackQueryHandler(back_to_text, pattern="back_text")],
-        BROADCAST_TIME: [CallbackQueryHandler(cast_decision), MessageHandler(filters.TEXT & ~filters.COMMAND, cast_schedule), CallbackQueryHandler(back_to_btns, pattern="back_btns")]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_wel, pattern="menu_wel")], states={SET_WEL_MEDIA: [MessageHandler(filters.PHOTO, save_wel_media), CallbackQueryHandler(del_wel_handler, pattern="del_wel")], SET_WEL_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_wel_text)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_upd, pattern="menu_upd"), CallbackQueryHandler(del_upd_link_handler, pattern="del_upd_link")], states={ADD_UPD_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_upd_link)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_force, pattern="menu_force"), CallbackQueryHandler(del_force_handler, pattern="del_force_links")], states={ADD_FORCE_MEDIA: [MessageHandler(filters.PHOTO, save_force_media)], ADD_FORCE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_force_text)], ADD_FORCE_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_force_links)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_btn, pattern="menu_btn"), CallbackQueryHandler(clear_custom_btns, pattern="clr_btns")], states={ADD_BTN_TXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_custom_btn)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(m_add, pattern="m_add")],
+        states={CONTENT_IN: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_content), MessageHandler(filters.ALL & ~filters.COMMAND, h_content)]},
+        fallbacks=fallback, allow_reentry=True
+    ))
+
+    # Broadcast
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(m_cast, pattern="m_cast")],
+        states={
+            BC_PHOTO: [MessageHandler(filters.ALL & ~filters.COMMAND, h_bc_photo), CallbackQueryHandler(h_bc_photo, pattern="skip")],
+            BC_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_bc_text)],
+            BC_TIME: [CallbackQueryHandler(h_bc_send)]
+        }, fallbacks=fallback, allow_reentry=True
+    ))
+
+    # Settings
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_wel, pattern="m_wel")], states={WEL_MEDIA: [MessageHandler(filters.PHOTO, save_w_media)], WEL_TEXT: [MessageHandler(filters.TEXT, save_w_text)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_upd, pattern="m_upd"), CallbackQueryHandler(del_upd, pattern="del_upd")], states={UPD_LINK: [MessageHandler(filters.TEXT, save_upd)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_force, pattern="m_force"), CallbackQueryHandler(del_force, pattern="del_force")], states={F_MEDIA: [MessageHandler(filters.PHOTO, save_f_media)], F_TEXT: [MessageHandler(filters.TEXT, save_f_text)], F_LINKS: [MessageHandler(filters.TEXT, save_f_links)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_btn, pattern="m_btn"), CallbackQueryHandler(del_btn, pattern="del_btn")], states={BTN_TXT: [MessageHandler(filters.TEXT, save_btn)]}, fallbacks=fallback, allow_reentry=True))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CallbackQueryHandler(cmd_admin, pattern="back_home"))
-    app.add_handler(CallbackQueryHandler(start_support, pattern="start_support"))
-    app.add_handler(CallbackQueryHandler(end_chat, pattern="^end_chat"))
-    app.add_handler(CallbackQueryHandler(verify_upd_cb, pattern="verify_upd"))
-    app.add_handler(CallbackQueryHandler(verify_access_cb, pattern="verify_access"))
+    app.add_handler(CallbackQueryHandler(back_home, pattern="back"))
+    
+    app.add_handler(CallbackQueryHandler(start_supp, pattern="supp"))
+    app.add_handler(CallbackQueryHandler(end_supp, pattern="^end_")) # Matches end_supp and end_admin_123
+    
+    app.add_handler(CallbackQueryHandler(chk_upd_cb, pattern="chk_upd"))
+    app.add_handler(CallbackQueryHandler(chk_force_cb, pattern="chk_force"))
     app.add_handler(CallbackQueryHandler(stats_cb, pattern="stats"))
     
-    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
-    app.add_handler(MessageHandler(filters.ALL, handle_msg))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_chat))
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.create_task(run_web_server())
-    print("Bot Running...")
+    loop.create_task(svr())
     app.run_polling()
 
-async def run_web_server():
+async def svr():
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="OK"))
     runner = web.AppRunner(app)
