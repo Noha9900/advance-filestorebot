@@ -119,10 +119,10 @@ def parse_link(link):
 
 # ================= ADMIN PANEL =================
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID: return ConversationHandler.END
     await db.add_user(ADMIN_ID, "Admin", "Admin") 
     
-    # Check if this is a callback (Back button) or command
+    # Check if callback or message
     is_callback = update.callback_query is not None
     
     kb = [
@@ -447,7 +447,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         context.user_data['pending_content'] = context.args[0]
         await check_join_status(update, context, uid)
-        return
+        return ConversationHandler.END
 
     # 2. NORMAL START (Show Welcome)
     w_txt = await db.get_setting('w_txt') or "Welcome!"
@@ -480,6 +480,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     # Auto-Delete after 15s (Cleanup)
     context.job_queue.run_once(del_msg, 15, data={'c': uid, 'm': msg.message_id})
+    return ConversationHandler.END
 
 async def check_join_status(update, context, uid):
     channels = await db.get_force_channels()
@@ -604,6 +605,10 @@ async def del_msg(context: ContextTypes.DEFAULT_TYPE):
 async def stats_cb(u, c):
     await u.callback_query.answer(f"Users: {await db.get_stats()}", show_alert=True)
 
+async def cancel_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
 # ================= MAIN =================
 def main():
     if not MONGO_URL: return
@@ -611,44 +616,48 @@ def main():
     db = Database(MONGO_URL)
     app = Application.builder().token(BOT_TOKEN).build()
     
-    # Conversations (ALL WITH allow_reentry=True)
+    # 1. FALLBACK COMMANDS (Universal Fix for "Stuck" States)
+    fallbacks_list = [CommandHandler("start", cmd_start), CommandHandler("admin", cmd_admin), CallbackQueryHandler(cmd_admin, pattern="back_home")]
+
+    # 2. CONVERSATION HANDLERS (With Fallbacks & Re-entry)
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_add, pattern="menu_add")],
-        states={CONTENT_INPUT: [MessageHandler(filters.TEXT, handle_content)]}, fallbacks=[CallbackQueryHandler(cmd_admin, pattern="back_home")], allow_reentry=True))
+        states={CONTENT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_content)]}, 
+        fallbacks=fallbacks_list, allow_reentry=True))
         
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_cast, pattern="menu_cast")],
         states={
-            BROADCAST_PHOTO: [MessageHandler(filters.ALL, cast_photo), CallbackQueryHandler(cast_photo, pattern="skip")],
-            BROADCAST_TEXT: [MessageHandler(filters.TEXT, cast_text), CallbackQueryHandler(cast_text, pattern="skip"), CallbackQueryHandler(back_to_photo, pattern="back_photo")],
-            BROADCAST_BUTTONS: [MessageHandler(filters.TEXT, cast_btns), CallbackQueryHandler(cast_btns, pattern="skip"), CallbackQueryHandler(back_to_text, pattern="back_text")],
-            BROADCAST_TIME: [CallbackQueryHandler(cast_decision), MessageHandler(filters.TEXT, cast_schedule), CallbackQueryHandler(back_to_btns, pattern="back_btns")]
-        }, fallbacks=[CallbackQueryHandler(cmd_admin, pattern="back_home")], allow_reentry=True))
+            BROADCAST_PHOTO: [MessageHandler(filters.ALL & ~filters.COMMAND, cast_photo), CallbackQueryHandler(cast_photo, pattern="skip")],
+            BROADCAST_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cast_text), CallbackQueryHandler(cast_text, pattern="skip"), CallbackQueryHandler(back_to_photo, pattern="back_photo")],
+            BROADCAST_BUTTONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, cast_btns), CallbackQueryHandler(cast_btns, pattern="skip"), CallbackQueryHandler(back_to_text, pattern="back_text")],
+            BROADCAST_TIME: [CallbackQueryHandler(cast_decision), MessageHandler(filters.TEXT & ~filters.COMMAND, cast_schedule), CallbackQueryHandler(back_to_btns, pattern="back_btns")]
+        }, fallbacks=fallbacks_list, allow_reentry=True))
         
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_wel, pattern="menu_wel")],
         states={
             SET_WEL_MEDIA: [MessageHandler(filters.PHOTO, save_wel_media), CallbackQueryHandler(del_wel_handler, pattern="del_wel")], 
-            SET_WEL_TEXT: [MessageHandler(filters.TEXT, save_wel_text)]
-        }, fallbacks=[CallbackQueryHandler(cmd_admin, pattern="back_home")], allow_reentry=True))
+            SET_WEL_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_wel_text)]
+        }, fallbacks=fallbacks_list, allow_reentry=True))
         
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_upd, pattern="menu_upd"), CallbackQueryHandler(del_upd_link_handler, pattern="del_upd_link")],
-        states={ADD_UPD_LINK: [MessageHandler(filters.TEXT, save_upd_link)]}, fallbacks=[CallbackQueryHandler(cmd_admin, pattern="back_home")], allow_reentry=True))
+        states={ADD_UPD_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_upd_link)]}, fallbacks=fallbacks_list, allow_reentry=True))
         
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_force, pattern="menu_force"), CallbackQueryHandler(del_force_handler, pattern="del_force_links")],
         states={
             ADD_FORCE_MEDIA: [MessageHandler(filters.PHOTO, save_force_media)],
-            ADD_FORCE_TEXT: [MessageHandler(filters.TEXT, save_force_text)],
-            ADD_FORCE_LINKS: [MessageHandler(filters.TEXT, save_force_links)]
-        }, fallbacks=[CallbackQueryHandler(cmd_admin, pattern="back_home")], allow_reentry=True))
+            ADD_FORCE_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_force_text)],
+            ADD_FORCE_LINKS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_force_links)]
+        }, fallbacks=fallbacks_list, allow_reentry=True))
 
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(menu_btn, pattern="menu_btn"), CallbackQueryHandler(clear_custom_btns, pattern="clr_btns")],
-        states={ADD_BTN_TXT: [MessageHandler(filters.TEXT, save_custom_btn)]}, fallbacks=[CallbackQueryHandler(cmd_admin, pattern="back_home")], allow_reentry=True))
+        states={ADD_BTN_TXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_custom_btn)]}, fallbacks=fallbacks_list, allow_reentry=True))
 
-    # Commands & Callbacks
+    # 3. GLOBAL HANDLERS
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(cmd_admin, pattern="back_home")) # Universal Back
@@ -657,7 +666,6 @@ def main():
     app.add_handler(CallbackQueryHandler(verify_access_cb, pattern="verify_access"))
     app.add_handler(CallbackQueryHandler(stats_cb, pattern="stats"))
     
-    # Messages
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.ALL, handle_msg))
 
