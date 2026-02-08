@@ -3,3 +3,4 @@ motor
 aiohttp
 nest_asyncio
 dnspython
+certifi
