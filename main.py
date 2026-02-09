@@ -129,7 +129,7 @@ async def m_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text(
         "<b>Send File / Link / Batch:</b>\n\n"
-        "1. <b>Forward File</b> (Best for Restricted)\n"
+        "1. <b>Forward File</b> (Recommended)\n"
         "2. <b>Single Link:</b> `https://t.me/c/xxx/100`\n"
         "3. <b>Batch:</b> `Link1 Link2`\n\n"
         "⚠️ <i>For links, I must be Admin in that channel!</i>",
@@ -381,7 +381,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     m = await context.bot.get_chat_member(cid, uid)
                     if m.status in ['left', 'kicked']: is_member = False
-                except: is_member = False # Assume not joined if check fails
+                except: is_member = False # Assume not joined if cant check
             else: is_member = False
 
     if not is_member and upd_link:
@@ -421,7 +421,7 @@ async def flow_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_force_join(update, context):
     uid = update.effective_user.id
-    
+    # Always check force join after welcome sequence
     channels = await db.get_force_channels()
     if channels:
         f_txt = await db.get_setting('f_txt') or "Join these to access files:"
@@ -444,7 +444,7 @@ async def chk_force_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def deliver(update, context, uid):
     lid = context.user_data.get('pl')
-    if not lid: return
+    if not lid: return await context.bot.send_message(uid, "✅ <b>Welcome!</b> Use buttons to explore.", parse_mode=ParseMode.HTML)
     
     data = await db.get_content(lid)
     if not data: return await context.bot.send_message(uid, "❌ Link Expired.")
@@ -452,7 +452,7 @@ async def deliver(update, context, uid):
     try:
         msgs = []
         if data['type'] == 'single':
-            # Priority: File ID
+            # Priority: Try File ID
             if data.get('fid'):
                 ftype, cap = data.get('ftype', 'doc'), data.get('cap', "")
                 if ftype == 'video': m = await context.bot.send_video(uid, data['fid'], caption=cap)
@@ -543,12 +543,12 @@ def main():
     
     fallback = [CommandHandler("start", cmd_start), CommandHandler("admin", cmd_admin), CallbackQueryHandler(back_home, pattern="back")]
 
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_add, pattern="m_add")], states={CONTENT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_content), MessageHandler(filters.ALL & ~filters.COMMAND, h_content)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_cast, pattern="m_cast")], states={BC_PHOTO: [MessageHandler(filters.ALL & ~filters.COMMAND, h_bc_photo), CallbackQueryHandler(h_bc_photo, pattern="skip")], BC_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_bc_text)], BC_TIME: [CallbackQueryHandler(h_bc_send)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_wel, pattern="m_wel")], states={WEL_MEDIA: [MessageHandler(filters.PHOTO, save_w_media)], WEL_TEXT: [MessageHandler(filters.TEXT, save_w_text)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_upd, pattern="m_upd"), CallbackQueryHandler(del_upd, pattern="del_upd")], states={UPD_LINK: [MessageHandler(filters.TEXT, save_upd)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_force, pattern="m_force"), CallbackQueryHandler(del_force, pattern="del_force")], states={F_MEDIA: [MessageHandler(filters.PHOTO, save_f_media)], F_TEXT: [MessageHandler(filters.TEXT, save_f_text)], F_LINKS: [MessageHandler(filters.TEXT, save_f_links)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_btn, pattern="m_btn"), CallbackQueryHandler(del_btn, pattern="del_btn")], states={BTN_TXT: [MessageHandler(filters.TEXT, save_btn)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_add, pattern="menu_add")], states={CONTENT_IN: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_content), MessageHandler(filters.ALL & ~filters.COMMAND, h_content)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_cast, pattern="menu_cast")], states={BC_PHOTO: [MessageHandler(filters.ALL & ~filters.COMMAND, h_bc_photo), CallbackQueryHandler(h_bc_photo, pattern="skip")], BC_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_bc_text)], BC_TIME: [CallbackQueryHandler(h_bc_send)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_wel, pattern="menu_wel")], states={WEL_MEDIA: [MessageHandler(filters.PHOTO, save_w_media)], WEL_TEXT: [MessageHandler(filters.TEXT, save_w_text)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_upd, pattern="menu_upd"), CallbackQueryHandler(del_upd, pattern="del_upd")], states={UPD_LINK: [MessageHandler(filters.TEXT, save_upd)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_force, pattern="menu_force"), CallbackQueryHandler(del_force, pattern="del_force")], states={F_MEDIA: [MessageHandler(filters.PHOTO, save_f_media)], F_TEXT: [MessageHandler(filters.TEXT, save_f_text)], F_LINKS: [MessageHandler(filters.TEXT, save_f_links)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_btn, pattern="menu_btn"), CallbackQueryHandler(del_btn, pattern="del_btn")], states={BTN_TXT: [MessageHandler(filters.TEXT, save_btn)]}, fallbacks=fallback, allow_reentry=True))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
