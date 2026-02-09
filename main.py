@@ -126,7 +126,8 @@ async def menu_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Send File / Link / Batch:</b>\n\n"
         "1. <b>Forward File</b> (Recommended)\n"
         "2. <b>Single Link:</b> `https://t.me/c/xxx/100`\n"
-        "3. <b>Batch:</b> `Link1 Link2`",
+        "3. <b>Batch:</b> `Link1 Link2` (Space separated)\n\n"
+        "⚠️ <i>For links, I must be Admin in that channel!</i>",
         reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
     )
     return CONTENT_INPUT
@@ -137,23 +138,24 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
 
     # A. LINKS
-    links = re.findall(r'(https?://t\.me/[^\s]+)', txt)
+    links = re.findall(r'(?:https?://)?t\.me/[^\s]+', txt)
     if links:
-        # Batch
+        # Batch (2 Links)
         if len(links) >= 2:
             c1, m1 = parse_link(links[0])
             c2, m2 = parse_link(links[1])
+            
             if not c1 or not c2 or c1 != c2:
-                await update.message.reply_text("❌ Error: Links must be from same channel.", reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text("❌ Error: Links must be from the same channel.", reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
             
-            try: await context.bot.copy_message(ADMIN_ID, c1, m1)
-            except Exception as e:
-                await update.message.reply_text(f"❌ Access Denied: {e}", reply_markup=InlineKeyboardMarkup(kb))
-                return CONTENT_INPUT
-
-            await db.save_content(uid, 'batch', c1, m1, end_id=m2)
-            await update.message.reply_text(f"✅ <b>Batch Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+            # Save Batch
+            # Ensure m1 is start and m2 is end
+            start_id = min(m1, m2)
+            end_id = max(m1, m2)
+            
+            await db.save_content(uid, 'batch', c1, start_id, end_id=end_id)
+            await update.message.reply_text(f"✅ <b>Batch Saved!</b> ({end_id - start_id + 1} files)\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
 
         # Single
@@ -161,11 +163,6 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
             c_id, m_id = parse_link(links[0])
             if not c_id:
                 await update.message.reply_text("❌ Invalid Link.", reply_markup=InlineKeyboardMarkup(kb))
-                return CONTENT_INPUT
-            
-            try: await context.bot.copy_message(ADMIN_ID, c_id, m_id)
-            except Exception as e:
-                await update.message.reply_text(f"❌ Access Denied: {e}", reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
 
             await db.save_content(uid, 'single', c_id, m_id)
@@ -180,13 +177,13 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif msg.photo: file_id, file_type = msg.photo[-1].file_id, 'photo'
         elif msg.audio: file_id, file_type = msg.audio.file_id, 'audio'
         
-        if file_id or msg.chat_id:
+        if file_id:
             src = msg.chat_id 
             await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption, file_id=file_id, file_type=file_type)
             await update.message.reply_text(f"✅ <b>File Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
     
-    await update.message.reply_text("❌ Send Link or File.", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("❌ Unknown content.", reply_markup=InlineKeyboardMarkup(kb))
     return CONTENT_INPUT
 
 # --- BROADCAST ---
@@ -204,14 +201,10 @@ async def cast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
     txt = "<b>Broadcast: Send Text</b> (or Skip)"
+    
     if update.message: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     else: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     return BC_TEXT
-
-async def back_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
-    await update.callback_query.edit_message_text("<b>Broadcast: Send Photo</b> (or Skip)", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-    return BC_PHOTO
 
 async def cast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query and update.callback_query.data == "skip":
@@ -359,17 +352,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await db.add_user(uid, update.effective_user.first_name, update.effective_user.username)
     
-    # Store deep link payload
+    # Store deep link payload if present
     if context.args:
         context.user_data['pl'] = context.args[0]
-        # Skip Update Channel check logic if deep link? 
-        # No, check if they are member first, but remember payload
         
-    # 1. Update Channel Check
+    # --- CHECK MEMBERSHIP ---
     upd_link = await db.get_setting('upd_link')
     is_member = True
     
     if upd_link:
+        # Check if user manually verified this session
         if not context.user_data.get('upd_verified'):
             cid = get_channel_id_from_link(upd_link)
             if cid:
@@ -377,59 +369,63 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     m = await context.bot.get_chat_member(cid, uid)
                     if m.status in ['left', 'kicked']: is_member = False
                 except: 
-                    # If bot can't check (not admin?), assume NOT member to be safe or force button
-                    is_member = False 
+                    # If bot can't check (not admin), force button just in case
+                    is_member = False
             else:
                 is_member = False
 
-    # IF NOT MEMBER: Show Welcome + Join Button
-    if not is_member and upd_link:
-        w_txt = await db.get_setting('w_txt') or "Welcome!"
-        w_ph = await db.get_setting('w_ph')
-        
-        btns = [InlineKeyboardButton("🔔 Join Update Channel", url=upd_link), InlineKeyboardButton("✅ I Have Joined", callback_data="chk_upd")]
-        cust = await db.get_custom_btns()
-        c_btns = [InlineKeyboardButton(b['name'], url=b['link']) for b in cust]
-        footer = [InlineKeyboardButton("🆘 Support Chat", callback_data="supp")]
-        
-        markup = InlineKeyboardMarkup(build_menu(btns, 2) + build_menu(c_btns, 2) + [footer])
-        
-        if w_ph: msg = await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=markup)
-        else: msg = await update.message.reply_text(w_txt, reply_markup=markup)
-        context.user_data['welcome_msg_id'] = msg.message_id
-        return
-
-    # IF MEMBER (or no update channel):
-    # Always show welcome screen first (as requested)
-    await show_welcome_screen(update, context)
-    
-    # Then proceed to flow
-    await flow_step_2(update, context)
-
-async def show_welcome_screen(update, context):
+    # Get Welcome Data
     w_txt = await db.get_setting('w_txt') or "Welcome!"
     w_ph = await db.get_setting('w_ph')
+    
+    # Build Buttons
+    btns = []
+    
+    # Update Channel Button (Only if NOT member)
+    if not is_member and upd_link:
+        btns.append(InlineKeyboardButton("🔔 Join Update Channel", url=upd_link))
+        btns.append(InlineKeyboardButton("✅ I Have Joined", callback_data="chk_upd"))
+    
+    # Custom Buttons
     cust = await db.get_custom_btns()
     c_btns = [InlineKeyboardButton(b['name'], url=b['link']) for b in cust]
-    footer = [InlineKeyboardButton("🆘 Support Chat", callback_data="supp")]
-    markup = InlineKeyboardMarkup(build_menu(c_btns, 2, footer))
     
-    # Check if we are updating a callback or sending new
-    if update.callback_query:
-        # If callback, we might want to send new to keep history or edit
-        # Usually for start flow we send new
-        await context.bot.send_message(update.effective_user.id, w_txt, reply_markup=markup)
-    else:
-        if w_ph: await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=markup)
-        else: await update.message.reply_text(w_txt, reply_markup=markup)
+    # Support Button (Always)
+    footer = [InlineKeyboardButton("🆘 Support Chat 24/7", callback_data="supp")]
+    
+    # Arrange Menu: [Upd/Join Row], [Custom Btn Row 1], [Custom Btn Row 2], [Support]
+    menu = []
+    if btns: menu.append(btns) # Join buttons in one row or two
+    menu.extend(build_menu(c_btns, 2))
+    menu.append(footer)
+    
+    reply_markup = InlineKeyboardMarkup(menu)
+    
+    # Send Welcome
+    msg = None
+    if w_ph: 
+        msg = await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=reply_markup)
+    else: 
+        msg = await update.message.reply_text(w_txt, reply_markup=reply_markup)
+    
+    context.user_data['welcome_msg_id'] = msg.message_id
+    
+    # If member, proceed immediately to step 2 (Support Msg -> Force Join)
+    if is_member:
+        # We don't delete welcome for members, we just show next steps
+        await flow_step_2(update, context)
+        
+    return ConversationHandler.END
 
 async def chk_upd_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # User clicked "I Have Joined"
     context.user_data['upd_verified'] = True
+    
+    # Delete Welcome Message to clean up
     try: await update.callback_query.message.delete()
     except: pass
     
-    # After join check, show standard welcome
-    await show_welcome_screen(update, context)
+    # Proceed
     await flow_step_2(update, context)
 
 async def flow_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -447,6 +443,7 @@ async def check_force_join(update, context):
     uid = update.effective_user.id
     channels = await db.get_force_channels()
     
+    # Always show force join if channels exist
     if channels:
         f_txt = await db.get_setting('f_txt') or "Join these to access files:"
         f_ph = await db.get_setting('f_ph')
@@ -462,6 +459,7 @@ async def check_force_join(update, context):
              await context.bot.send_message(uid, f_txt, reply_markup=markup)
         return
 
+    # If no force join, go to delivery
     await deliver(update, context, uid)
 
 async def chk_force_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -471,14 +469,31 @@ async def chk_force_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def deliver(update, context, uid):
     lid = context.user_data.get('pl')
-    if not lid: return # No file requested
+    if not lid: return
     
     data = await db.get_content(lid)
     if not data: return await context.bot.send_message(uid, "❌ Link Expired.")
     
     try:
         msgs = []
-        if data['type'] == 'single':
+        # BATCH DELIVERY (FIXED)
+        if data['type'] == 'batch':
+            await context.bot.send_message(uid, "📂 <b>Sending Batch...</b>", parse_mode=ParseMode.HTML)
+            start = int(data['msg'])
+            end = int(data['end'])
+            
+            # Iterate through EVERY ID in the range
+            for i in range(start, end + 1):
+                try:
+                    # Copy specific message ID from source
+                    m = await context.bot.copy_message(uid, data['src'], i)
+                    msgs.append(m.message_id)
+                    await asyncio.sleep(1) # Delay to prevent flood wait
+                except Exception:
+                    continue # Skip deleted/inaccessible messages, keep going
+        
+        # SINGLE DELIVERY
+        elif data['type'] == 'single':
             if data.get('fid'):
                 ftype, cap = data.get('ftype', 'doc'), data.get('cap', "")
                 if ftype == 'video': m = await context.bot.send_video(uid, data['fid'], caption=cap)
@@ -489,26 +504,11 @@ async def deliver(update, context, uid):
             else:
                 m = await context.bot.copy_message(uid, data['src'], data['msg'], caption=data.get('cap', ""))
                 msgs.append(m.message_id)
-                
-        elif data['type'] == 'batch':
-            await context.bot.send_message(uid, "📂 <b>Sending Batch...</b>", parse_mode=ParseMode.HTML)
-            # FIXED BATCH LOOP
-            start = data['msg']
-            end = data['end']
-            
-            for i in range(start, end + 1):
-                try:
-                    # Try to copy each message ID
-                    m = await context.bot.copy_message(uid, data['src'], i)
-                    msgs.append(m.message_id)
-                    await asyncio.sleep(0.5) # Flood wait prevention
-                except Exception:
-                    continue # Skip invalid/deleted messages
         
         info = await context.bot.send_message(uid, "⚠️ <b>Files auto-delete in 30 mins.</b>\nLink works permanently.", parse_mode=ParseMode.HTML)
         msgs.append(info.message_id)
         
-        # Schedule deletions
+        # Schedule deletion for ALL messages
         for m_id in msgs: 
             context.job_queue.run_once(del_msg, 1800, data={'c': uid, 'm': m_id})
             
