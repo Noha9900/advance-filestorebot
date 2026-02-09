@@ -1,7 +1,6 @@
 pyrogram
 tgcrypto
 motor
-pymongo[srv]
+dnspython
+flask
 pytz
-apscheduler
-aiohttp
