@@ -1,113 +1,96 @@
-import os, asyncio, uuid, pytz
-from datetime import datetime, timedelta
-from pyrogram import Client, filters, types, errors
+import os
+import asyncio
+from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from motor.motor_asyncio import AsyncIOMotorClient
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiohttp import web
+from datetime import datetime, timedelta
+import pytz
 
-# --- CONFIG ---
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-MONGO_URL = os.getenv("MONGO_URL")
-ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",")]
-PORT = int(os.getenv("PORT", 8080))
+# --- CONFIGURATION ---
+API_ID = int(os.environ.get("API_ID", "12345"))
+API_HASH = os.environ.get("API_HASH", "your_hash")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_token")
+MONGO_URL = os.environ.get("MONGO_URL", "your_mongodb_url")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "your_user_id"))
 
-app = Client("ComplexBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-db = AsyncIOMotorClient(MONGO_URL).FileStoreBot
-scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
+client = Client("FileStoreBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+db_client = AsyncIOMotorClient(MONGO_URL)
+db = db_client.FileStoreBot
+users_db = db.users
+settings_db = db.settings
 
-admin_states = {} 
-batch_temp = {}
+IST = pytz.timezone('Asia/Kolkata')
 
-# --- KEYBOARDS ---
-def glass_markup(rows):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(text, cb) for text, cb in row] for row in rows])
+# --- HELPER FUNCTIONS ---
+async def is_subscribed(user_id):
+    settings = await settings_db.find_one({"id": "force_sub"})
+    if not settings or not settings.get("channels"):
+        return True
+    for channel in settings["channels"]:
+        try:
+            member = await client.get_chat_member(channel, user_id)
+            if member.status == enums.ChatMemberStatus.LEFT:
+                return False
+        except Exception:
+            return False
+    return True
 
-def get_admin_main():
-    return glass_markup([
-        [("👋 Welcome Set", "set_welcome"), ("📢 Force Join", "set_fjoin")],
-        [("🎧 Support Status", "toggle_support"), ("📂 Batch Store", "start_batch")],
-        [("🚀 Broadcast", "bcast_menu"), ("📊 Stats", "stats")],
-        [("🗑 Delete", "delete_msg")]
-    ])
+# --- BUTTON FACTORY ---
+def get_main_buttons(is_admin=False):
+    buttons = [
+        [InlineKeyboardButton("📁 Store File 📁", callback_data="store_file"),
+         InlineKeyboardButton("🚀 Batch 🚀", callback_data="batch_store")],
+        [InlineKeyboardButton("🎧 Support 🎧", callback_data="support_chat")]
+    ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton("⚙️ Admin Panel ⚙️", callback_data="admin_main")])
+    return InlineKeyboardMarkup(buttons)
 
-# --- DATABASE HELPERS ---
-async def get_config():
-    config = await db.settings.find_one({"id": "config"})
-    if not config:
-        config = {"id": "config", "support_active": True, "welcome_enabled": True, "fjoin_channels": [], "welcome_text": "Welcome {name}!", "welcome_sec": 10}
-        await db.settings.insert_one(config)
-    return config
-
-# --- ADMIN COMMAND HANDLER ---
-@app.on_message(filters.command("admin") & filters.user(ADMINS))
-async def admin_cmd_handler(c, m):
-    await m.reply_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
-
-# --- CALLBACK QUERY HANDLER (Buttons Logic) ---
-@app.on_callback_query()
-async def cb_handler(c, cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS:
-        return await cb.answer("❌ Access Denied", show_alert=True)
+# --- HANDLERS ---
+@client.on_message(filters.command("start"))
+async def start_handler(bot, message):
+    user_id = message.from_user.id
+    await users_db.update_one({"id": user_id}, {"$set": {"last_seen": datetime.now()}}, upsert=True)
     
-    data = cb.data
-    if data == "main_admin":
-        await cb.message.edit_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
-    elif data == "delete_msg":
-        await cb.message.delete()
-    elif data == "stats":
-        u_count = await db.users.count_documents({})
-        b_count = await db.batches.count_documents({})
-        await cb.message.edit_text(f"📊 **Stats**\n\nUsers: `{u_count}`\nBatches: `{b_count}`", reply_markup=glass_markup([[("⬅️ Back", "main_admin")]]))
-    # Add other data handlers (set_welcome, toggle_support, etc.) here
+    if not await is_subscribed(user_id):
+        # Implementation of Force Sub logic
+        return await message.reply_photo(
+            photo="https://telegra.ph/file/your_image.jpg",
+            caption="⚠️ **Access Denied!**\n\nPlease join our channels to use this bot.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Join Channel", url="https://t.me/yourchannel")]])
+        )
 
-# --- USER HANDLER (WELCOME & BATCH) ---
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(c, m):
-    await db.users.update_one({"id": m.from_user.id}, {"$set": {"name": m.from_user.first_name}}, upsert=True)
-    config = await get_config()
+    await message.reply_text(
+        f"👋 **Welcome {message.from_user.mention}!**\nI am a Permanent File Store Bot.",
+        reply_markup=get_main_buttons(user_id == ADMIN_ID)
+    )
 
-    if config.get("welcome_enabled"):
-        welcome_text = config.get("welcome_text", "Welcome {name}!").replace("{name}", m.from_user.first_name)
-        w_photo = config.get("welcome_photo")
-        msg = await (m.reply_photo(w_photo, caption=welcome_text) if w_photo else m.reply_text(welcome_text))
-        
-        async def auto_del(message, delay):
-            await asyncio.sleep(delay)
-            try: await message.delete()
-            except: pass
-        asyncio.create_task(auto_del(msg, config.get("welcome_sec", 10)))
+@client.on_callback_query()
+async def cb_handler(bot, cb: CallbackQuery):
+    if cb.data == "admin_main" and cb.from_user.id == ADMIN_ID:
+        await cb.message.edit_text(
+            "🛠 **Admin Control Center**",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("👋 Welcome Set", callback_data="set_welcome"),
+                 InlineKeyboardButton("📢 Force Join", callback_data="set_force")],
+                [InlineKeyboardButton("📊 Statistics", callback_data="stats"),
+                 InlineKeyboardButton("📡 Broadcast", callback_data="broadcast")],
+                [InlineKeyboardButton("🔙 Back", callback_data="home")]
+            ])
+        )
+    elif cb.data == "home":
+        await cb.message.edit_text("Main Menu", reply_markup=get_main_buttons(cb.from_user.id == ADMIN_ID))
 
-    if len(m.text.split()) > 1:
-        payload = m.text.split()[1]
-        if payload.startswith("batch_"):
-            batch_id = payload.replace("batch_", "")
-            batch_data = await db.batches.find_one({"batch_id": batch_id})
-            if batch_data:
-                sent_files = []
-                for f_id in batch_data["files"]:
-                    s = await c.send_cached_media(m.chat.id, f_id)
-                    sent_files.append(s.id)
-                await m.reply("⏳ Files will delete in 30 minutes.")
-                scheduler.add_job(lambda: c.delete_messages(m.chat.id, sent_files), "date", run_date=datetime.now() + timedelta(minutes=30))
+# --- KEEP ALIVE FOR RENDER ---
+from flask import Flask
+from threading import Thread
 
-# --- WEB SERVER & MAIN ---
-async def web_handle(request): return web.Response(text="Bot Live")
+app = Flask(__name__)
+@app.route('/')
+def index(): return "Bot is Running"
 
-async def start_web_server():
-    webapp = web.Application()
-    webapp.router.add_get("/", web_handle)
-    runner = web.AppRunner(webapp)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
-
-async def main():
-    if not scheduler.running: scheduler.start()
-    await start_web_server()
-    await app.start()
-    await asyncio.Event().wait()
+def run(): app.run(host="0.0.0.0", port=8080)
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    Thread(target=run).start()
+    client.run()
