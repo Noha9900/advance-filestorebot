@@ -1,8 +1,8 @@
-python-telegram-bot==20.7
+pyrogram
+tgcrypto
 motor
-aiohttp
-nest_asyncio
-dnspython
-certifi
+pymongo[srv]
 pytz
 apscheduler
+flask
+gunicorn
