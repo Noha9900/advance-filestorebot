@@ -4,6 +4,7 @@ from pyrogram import Client, filters, types
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from motor.motor_asyncio import AsyncIOMotorClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiohttp import web  # Added for Port binding
 
 # --- CONFIG ---
 API_ID = int(os.getenv("API_ID"))
@@ -11,6 +12,7 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",")]
+PORT = int(os.getenv("PORT", 8080)) # Port for Render
 
 app = Client("ComplexBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 db = AsyncIOMotorClient(MONGO_URL).FileStoreBot
@@ -64,9 +66,8 @@ async def finalize_batch(c, cb):
 # --- SUPPORT CHAT LOGIC ---
 @app.on_message(filters.private & ~filters.user(ADMINS))
 async def support_handler(c, m):
-    # Check Force Join First
     config = await db.settings.find_one({"id": "config"})
-    if not config.get("support_active"): return
+    if not config or not config.get("support_active"): return
     
     if m.video and m.video.duration > 180:
         return await m.reply("❌ Videos over 3 mins not allowed.")
@@ -86,26 +87,42 @@ async def start_handler(c, m):
         data = await db.batches.find_one({"batch_id": b_id})
         
         sent_msgs = []
-        for f in data['files']:
-            s = await c.send_cached_media(m.chat.id, f)
-            sent_msgs.append(s.id)
-        
-        await m.reply("⏳ These files will be deleted in 30 minutes.")
-        # Schedule deletion
-        scheduler.add_job(delete_batch_msgs, "date", 
-                          run_date=datetime.now() + timedelta(minutes=30), 
-                          args=[m.chat.id, sent_msgs])
+        if data:
+            for f in data['files']:
+                s = await c.send_cached_media(m.chat.id, f)
+                sent_msgs.append(s.id)
+            
+            await m.reply("⏳ These files will be deleted in 30 minutes.")
+            scheduler.add_job(delete_batch_msgs, "date", 
+                              run_date=datetime.now() + timedelta(minutes=30), 
+                              args=[m.chat.id, sent_msgs])
 
 async def delete_batch_msgs(chat_id, msg_ids):
     await app.delete_messages(chat_id, msg_ids)
 
-# --- BROADCAST SCHEDULER (IST) ---
+# --- BROADCAST SCHEDULER ---
 @app.on_callback_query(filters.regex("bcast_menu"))
 async def bcast_setup(c, cb):
-    # Logic to ask for Date/Time (YYYY-MM-DD HH:MM)
-    # Then scheduler.add_job(...)
     pass
 
-if __name__ == "__main__":
+# --- PORT 8080 SERVER FOR RENDER ---
+async def handle(request):
+    return web.Response(text="Bot is Running!")
+
+async def start_server():
+    server = web.Server(handle)
+    runner = web.ServerRunner(server)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+# --- MAIN RUNNER ---
+async def main():
     scheduler.start()
-    app.run()
+    await start_server() # Start the Port listener
+    await app.start()
+    print("Bot is alive!")
+    await asyncio.Event().wait() # Keeps the script running
+
+if __name__ == "__main__":
+    asyncio.get_event_loop().run_until_complete(main())
