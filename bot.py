@@ -41,25 +41,45 @@ async def get_config():
         await db.settings.insert_one(config)
     return config
 
+# --- ADMIN COMMAND HANDLER ---
+@app.on_message(filters.command("admin") & filters.user(ADMINS))
+async def admin_cmd_handler(c, m):
+    await m.reply_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
+
+# --- CALLBACK QUERY HANDLER (Buttons Logic) ---
+@app.on_callback_query()
+async def cb_handler(c, cb: CallbackQuery):
+    if cb.from_user.id not in ADMINS:
+        return await cb.answer("❌ Access Denied", show_alert=True)
+    
+    data = cb.data
+    if data == "main_admin":
+        await cb.message.edit_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
+    elif data == "delete_msg":
+        await cb.message.delete()
+    elif data == "stats":
+        u_count = await db.users.count_documents({})
+        b_count = await db.batches.count_documents({})
+        await cb.message.edit_text(f"📊 **Stats**\n\nUsers: `{u_count}`\nBatches: `{b_count}`", reply_markup=glass_markup([[("⬅️ Back", "main_admin")]]))
+    # Add other data handlers (set_welcome, toggle_support, etc.) here
+
 # --- USER HANDLER (WELCOME & BATCH) ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(c, m):
     await db.users.update_one({"id": m.from_user.id}, {"$set": {"name": m.from_user.first_name}}, upsert=True)
     config = await get_config()
 
-    # 1. WELCOME LOGIC
     if config.get("welcome_enabled"):
         welcome_text = config.get("welcome_text", "Welcome {name}!").replace("{name}", m.from_user.first_name)
         w_photo = config.get("welcome_photo")
         msg = await (m.reply_photo(w_photo, caption=welcome_text) if w_photo else m.reply_text(welcome_text))
         
-        async def auto_del():
-            await asyncio.sleep(config.get("welcome_sec", 10))
-            try: await msg.delete()
+        async def auto_del(message, delay):
+            await asyncio.sleep(delay)
+            try: await message.delete()
             except: pass
-        asyncio.create_task(auto_del())
+        asyncio.create_task(auto_del(msg, config.get("welcome_sec", 10)))
 
-    # 2. BATCH DELIVERY LOGIC
     if len(m.text.split()) > 1:
         payload = m.text.split()[1]
         if payload.startswith("batch_"):
@@ -70,14 +90,11 @@ async def start_handler(c, m):
                 for f_id in batch_data["files"]:
                     s = await c.send_cached_media(m.chat.id, f_id)
                     sent_files.append(s.id)
-                
                 await m.reply("⏳ Files will delete in 30 minutes.")
-                scheduler.add_job(lambda: c.delete_messages(m.chat.id, sent_files), "date", 
-                                  run_date=datetime.now() + timedelta(minutes=30))
+                scheduler.add_job(lambda: c.delete_messages(m.chat.id, sent_files), "date", run_date=datetime.now() + timedelta(minutes=30))
 
-# --- WEB SERVER (PREVENTS RENDER CRASH) ---
-async def web_handle(request):
-    return web.Response(text="Bot is Live")
+# --- WEB SERVER & MAIN ---
+async def web_handle(request): return web.Response(text="Bot Live")
 
 async def start_web_server():
     webapp = web.Application()
