@@ -45,6 +45,11 @@ class Database:
         if user_id == ADMIN_ID:
             await self.settings.update_one({'_id': 'admin_stat'}, {'$set': {'seen': datetime.now()}}, upsert=True)
 
+    async def is_admin_online(self):
+        doc = await self.settings.find_one({'_id': 'admin_stat'})
+        if not doc: return False
+        return (datetime.now() - doc['seen']).total_seconds() < 600
+
     async def get_all_users(self):
         cursor = self.users.find({})
         return [doc['_id'] async for doc in cursor]
@@ -82,10 +87,8 @@ def build_menu(buttons, n_cols=2, footer_buttons=None):
     return menu
 
 def parse_link(link):
-    # Regex for Private/Restricted: t.me/c/123456/100
     m = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if m: return int("-100" + m.group(1)), int(m.group(2))
-    # Regex for Public: t.me/username/100
     m = re.search(r't\.me/([\w\d_]+)/(\d+)', link)
     if m: return "@" + m.group(1), int(m.group(2))
     return None, None
@@ -97,7 +100,14 @@ def get_channel_id_from_link(link):
     return None
 
 # ================= STATES =================
-(CONTENT_INPUT, BC_PHOTO, BC_TEXT, BC_BTNS, BC_TIME, WEL_MEDIA, WEL_TEXT, UPD_LINK, F_MEDIA, F_TEXT, F_LINKS, BTN_TXT) = range(12)
+(
+    CONTENT_INPUT, 
+    BC_PHOTO, BC_TEXT, BC_TIME, 
+    WEL_MEDIA, WEL_TEXT, 
+    UPD_LINK, 
+    F_MEDIA, F_TEXT, F_LINKS, 
+    BTN_TXT
+) = range(12)
 
 # ================= ADMIN =================
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,54 +136,47 @@ async def menu_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text(
         "<b>Send File / Link / Batch:</b>\n\n"
-        "1. <b>Forward File</b> (Restricted Works!)\n"
+        "1. <b>Forward File</b> (Recommended)\n"
         "2. <b>Single Link:</b> `https://t.me/c/xxx/100`\n"
         "3. <b>Batch:</b> `Link1 Link2`\n\n"
-        "⚠️ <i>For Links: Bot MUST be Admin in Channel!</i>",
+        "⚠️ <i>For links, I must be Admin in that channel!</i>",
         reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
     )
     return CONTENT_INPUT
 
 async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    txt = msg.text or msg.caption or ""
+    msg, txt = update.message, update.message.text or ""
     uid = str(uuid.uuid4())[:8]
     kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
 
     # A. LINKS
-    links = re.findall(r'(?:https?://)?t\.me/[^\s]+', txt)
+    links = re.findall(r'(https?://t\.me/[^\s]+)', txt)
     if links:
-        # Batch
         if len(links) >= 2:
             c1, m1 = parse_link(links[0])
             c2, m2 = parse_link(links[1])
-            
             if not c1 or not c2 or c1 != c2:
                 await update.message.reply_text("❌ Error: Links must be from the same channel.", reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
             
-            # Verify Access
-            try:
-                await context.bot.copy_message(ADMIN_ID, c1, m1)
+            try: await context.bot.copy_message(ADMIN_ID, c1, m1)
             except Exception as e:
-                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nI cannot access the Start Message.\nEnsure I am Admin in that channel.\n\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nBot must be Admin in the channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
 
             await db.save_content(uid, 'batch', c1, m1, end_id=m2)
-            await update.message.reply_text(f"✅ <b>Batch Saved!</b> ({m2-m1+1} files)\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"✅ <b>Batch Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
 
-        # Single
         elif len(links) == 1:
             c_id, m_id = parse_link(links[0])
             if not c_id:
                 await update.message.reply_text("❌ Invalid Link Format.", reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
             
-            try:
-                await context.bot.copy_message(ADMIN_ID, c_id, m_id)
+            try: await context.bot.copy_message(ADMIN_ID, c_id, m_id)
             except Exception as e:
-                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nBot must be Admin in the channel.\n\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nBot must be Admin.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
 
             await db.save_content(uid, 'single', c_id, m_id)
@@ -188,14 +191,13 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif msg.photo: file_id, file_type = msg.photo[-1].file_id, 'photo'
         elif msg.audio: file_id, file_type = msg.audio.file_id, 'audio'
         
-        # Save using Current Chat ID (Admin DM) as source
         if file_id or msg.chat_id:
             src = msg.chat_id 
             await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption, file_id=file_id, file_type=file_type)
             await update.message.reply_text(f"✅ <b>File Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
     
-    await update.message.reply_text("❌ Unknown content. Send Link or Forward File.", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("❌ Unknown format. Send Link or File.", reply_markup=InlineKeyboardMarkup(kb))
     return CONTENT_INPUT
 
 # --- BROADCAST ---
@@ -211,11 +213,17 @@ async def cast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         context.user_data['bc_photo'] = update.message.photo[-1].file_id if update.message and update.message.photo else None
     
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back_photo")]]
     txt = "<b>Broadcast: Send Text</b> (or Skip)"
     if update.message: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     else: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     return BC_TEXT
+
+async def back_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This function allows going back to the photo step
+    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    await update.callback_query.edit_message_text("<b>Broadcast: Send Photo</b> (or Skip)", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    return BC_PHOTO
 
 async def cast_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query and update.callback_query.data == "skip":
@@ -252,7 +260,7 @@ async def run_broadcast(context):
 
 # --- FORCE JOIN ---
 async def menu_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("🗑️ Delete All Links", callback_data="del_force")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    kb = [[InlineKeyboardButton("🗑️ Delete All", callback_data="del_force")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text("Send <b>Force Join Photo</b> (or /cancel).", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
     return F_MEDIA
 
@@ -378,7 +386,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     m = await context.bot.get_chat_member(cid, uid)
                     if m.status in ['left', 'kicked']: is_member = False
-                except: is_member = False # Assume not joined if cant check
+                except: is_member = False 
             else: is_member = False
 
     if not is_member and upd_link:
