@@ -37,89 +37,9 @@ def get_admin_main():
 async def get_config():
     config = await db.settings.find_one({"id": "config"})
     if not config:
-        config = {"id": "config", "support_active": True, "welcome_enabled": False, "fjoin_channels": [], "welcome_text": "Welcome {name}!", "welcome_sec": 10}
+        config = {"id": "config", "support_active": True, "welcome_enabled": True, "fjoin_channels": [], "welcome_text": "Welcome {name}!", "welcome_sec": 10}
         await db.settings.insert_one(config)
     return config
-
-# --- ADMIN CALLBACK HANDLERS ---
-@app.on_callback_query()
-async def cb_handler(c, cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS:
-        return await cb.answer("❌ Admin Only!", show_alert=True)
-    
-    data = cb.data
-    config = await get_config()
-
-    if data == "main_admin":
-        await cb.message.edit_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
-    
-    elif data == "stats":
-        u_count = await db.users.count_documents({})
-        b_count = await db.batches.count_documents({})
-        await cb.message.edit_text(f"📊 **Statistics**\n\n👤 Total Users: `{u_count}`\n📂 Total Batches: `{b_count}`", 
-                                   reply_markup=glass_markup([[("⬅️ Back", "main_admin")]]))
-
-    elif data == "toggle_support":
-        new_val = not config.get("support_active", True)
-        await db.settings.update_one({"id": "config"}, {"$set": {"support_active": new_val}})
-        await cb.answer(f"Support is now {'ON' if new_val else 'OFF'}", show_alert=True)
-
-    elif data == "set_fjoin":
-        admin_states[cb.from_user.id] = "waiting_fjoin"
-        await cb.message.edit_text("📢 **Send Channel IDs** separated by commas.\nExample: `-100123,-100456`", reply_markup=glass_markup([[("❌ Cancel", "main_admin")]]))
-
-    elif data == "start_batch":
-        batch_temp[cb.from_user.id] = []
-        await cb.message.edit_text("📤 **Batch Mode Active**\nSend files/videos now. Click **Done** when finished.", 
-                                   reply_markup=glass_markup([[("✅ Done", "save_batch")]]))
-
-    elif data == "save_batch":
-        u_id = cb.from_user.id
-        if not batch_temp.get(u_id): return await cb.answer("No files added!")
-        b_id = str(uuid.uuid4())[:8]
-        await db.batches.insert_one({"batch_id": b_id, "files": batch_temp[u_id]})
-        link = f"https://t.me/{(await c.get_me()).username}?start=batch_{b_id}"
-        await cb.message.edit_text(f"✅ **Batch Saved!**\nLink: `{link}`", reply_markup=get_admin_main())
-        del batch_temp[u_id]
-
-    elif data == "bcast_menu":
-        admin_states[cb.from_user.id] = "waiting_bcast"
-        await cb.message.edit_text("🚀 **Send Broadcast Message**\nAnything you send now will go to all users.", reply_markup=glass_markup([[("❌ Cancel", "main_admin")]]))
-
-    elif data == "delete_msg":
-        await cb.message.delete()
-
-# --- ADMIN INPUT PROCESSOR ---
-@app.on_message(filters.user(ADMINS) & filters.private & ~filters.command(["admin", "start"]))
-async def admin_input_processor(c, m):
-    uid = m.from_user.id
-    if uid in batch_temp:
-        f_id = m.document.file_id if m.document else (m.video.file_id if m.video else m.photo.file_id)
-        batch_temp[uid].append(f_id)
-        return await m.reply(f"📥 Added. Total: {len(batch_temp[uid])}")
-
-    if uid not in admin_states: return
-    state = admin_states[uid]
-
-    if state == "waiting_fjoin":
-        try:
-            ids = [int(i.strip()) for i in m.text.split(",")]
-            await db.settings.update_one({"id": "config"}, {"$set": {"fjoin_channels": ids}})
-            await m.reply("✅ Force Join Updated!", reply_markup=get_admin_main())
-        except: await m.reply("❌ Invalid IDs.")
-    
-    elif state == "waiting_bcast":
-        users = db.users.find({})
-        count = 0
-        async for user in users:
-            try:
-                await m.copy(user['id'])
-                count += 1
-                await asyncio.sleep(0.1)
-            except: pass
-        await m.reply(f"✅ Broadcast Finished. Sent to {count} users.")
-    
-    del admin_states[uid]
 
 # --- COMMANDS ---
 @app.on_message(filters.command("admin") & filters.user(ADMINS))
@@ -128,20 +48,56 @@ async def admin_cmd(c, m):
 
 @app.on_message(filters.command("start") & filters.private)
 async def start_cmd(c, m):
+    # Save User to DB
     await db.users.update_one({"id": m.from_user.id}, {"$set": {"name": m.from_user.first_name}}, upsert=True)
-    # [Insert your Welcome/FJoin Logic here as per previous steps]
-    await m.reply("Bot is Active! Send /admin to manage.")
+    
+    config = await get_config()
+    
+    # 1. SEND WELCOME MESSAGE
+    if config.get("welcome_enabled"):
+        welcome_text = config.get("welcome_text", "Welcome {name}!").replace("{name}", m.from_user.first_name)
+        w_photo = config.get("welcome_photo")
+        
+        if w_photo:
+            welcome_msg = await m.reply_photo(w_photo, caption=welcome_text)
+        else:
+            welcome_msg = await m.reply_text(welcome_text)
+            
+        # AUTO-DELETE WELCOME
+        async def delete_welcome():
+            await asyncio.sleep(config.get("welcome_sec", 10))
+            try: await welcome_msg.delete()
+            except: pass
+        asyncio.create_task(delete_welcome())
 
-# --- SERVER ---
-async def main():
-    if not scheduler.running: scheduler.start()
-    webapp = web.Application()
-    webapp.router.add_get("/", lambda r: web.Response(text="Bot Running"))
-    runner = web.AppRunner(webapp)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    await app.start()
-    await asyncio.Event().wait()
+    # 2. HANDLE BATCH RETRIEVAL
+    if len(m.text.split()) > 1:
+        payload = m.text.split()[1]
+        if payload.startswith("batch_"):
+            batch_id = payload.replace("batch_", "")
+            batch_data = await db.batches.find_one({"batch_id": batch_id})
+            
+            if not batch_data:
+                return await m.reply_text("❌ This batch link has expired or is invalid.")
+            
+            sent_files = []
+            for file_id in batch_data["files"]:
+                try:
+                    # Send as cached media to avoid re-uploading
+                    sent = await c.send_cached_media(m.chat.id, file_id)
+                    sent_files.append(sent.id)
+                    await asyncio.sleep(0.5) # Prevent flood
+                except Exception as e:
+                    print(f"Error sending file: {e}")
 
-if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+            await m.reply_text("⏳ **Security Alert:** These files will be deleted in 30 minutes.")
+            
+            # SCHEDULE 30-MIN DELETE
+            scheduler.add_job(
+                lambda: c.delete_messages(m.chat.id, sent_files),
+                "date",
+                run_date=datetime.now() + timedelta(minutes=30)
+            )
+
+# --- ADMIN INPUT & CALLBACKS ---
+# (Keep your existing cb_handler and admin_input_processor logic here)
