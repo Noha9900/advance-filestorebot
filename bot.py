@@ -36,28 +36,34 @@ def run_flask():
 
 # --- BUTTON FACTORY ---
 def main_menu(is_admin=False):
-    buttons = [
-        [InlineKeyboardButton("📂 File Store", callback_data="file_store"),
-         InlineKeyboardButton("📦 Batch Store", callback_data="batch_store")],
-        [InlineKeyboardButton("🎧 Support Chat", callback_data="user_support")]
-    ]
     if is_admin:
-        buttons.append([InlineKeyboardButton("⚙️ Admin Panel ⚙️", callback_data="admin_panel")])
+        # Admin sees everything
+        buttons = [
+            [InlineKeyboardButton("📂 File Store", callback_data="file_store"),
+             InlineKeyboardButton("📦 Batch Store", callback_data="batch_store")],
+            [InlineKeyboardButton("🎧 Support Chat", callback_data="user_support")],
+            [InlineKeyboardButton("⚙️ Admin Panel ⚙️", callback_data="admin_panel")]
+        ]
+    else:
+        # Users ONLY see Support Chat
+        buttons = [
+            [InlineKeyboardButton("🎧 Support Chat", callback_data="user_support")]
+        ]
     return InlineKeyboardMarkup(buttons)
 
 # --- CORE LOGIC ---
 @bot.on_message(filters.command("start"))
 async def start_cmd(client, message):
     user_id = message.from_user.id
-    # Save user to DB
     await users_col.update_one({"id": user_id}, {"$set": {"name": message.from_user.first_name, "active": True}}, upsert=True)
     
-    # 1. Welcome Message Logic (Check DB for settings)
     welcome = await settings_col.find_one({"type": "welcome"})
     if welcome:
-        sent_msg = await message.reply_photo(photo=welcome['photo'], caption=welcome['text']) if welcome.get('photo') else await message.reply_text(welcome['text'])
-        # Auto-delete after X seconds
-        asyncio.get_event_loop().call_later(welcome.get('seconds', 10), lambda: bot.delete_messages(message.chat.id, sent_msg.id))
+        try:
+            sent_msg = await message.reply_photo(photo=welcome['photo'], caption=welcome['text']) if welcome.get('photo') else await message.reply_text(welcome['text'])
+            asyncio.get_event_loop().call_later(welcome.get('seconds', 10), lambda: bot.delete_messages(message.chat.id, sent_msg.id))
+        except:
+            pass
 
     await message.reply_text("💎 **Main Menu** 💎", reply_markup=main_menu(user_id == ADMIN_ID))
 
@@ -66,6 +72,7 @@ async def cb_handler(client, cb: CallbackQuery):
     data = cb.data
     user_id = cb.from_user.id
 
+    # 1. ADMIN PANEL NAVIGATION
     if data == "admin_panel" and user_id == ADMIN_ID:
         await cb.message.edit_text(
             "🛠 **Admin Control Panel**",
@@ -79,6 +86,31 @@ async def cb_handler(client, cb: CallbackQuery):
             ])
         )
     
+    # 2. FIXING BUTTONS (ADMIN ONLY FEATURES)
+    elif data in ["file_store", "batch_store"] and user_id == ADMIN_ID:
+        await cb.answer(f"Triggered {data.replace('_', ' ').title()}...", show_alert=True)
+        await cb.message.reply_text(f"Please send the file(s) you want to store.")
+
+    elif data == "view_stats" and user_id == ADMIN_ID:
+        count = await users_col.count_documents({})
+        await cb.answer(f"Total Users: {count}", show_alert=True)
+
+    elif data == "toggle_support" and user_id == ADMIN_ID:
+        # Simple toggle logic
+        current = await settings_col.find_one({"type": "support_status"})
+        new_status = not current['active'] if current else True
+        await settings_col.update_one({"type": "support_status"}, {"$set": {"active": new_status}}, upsert=True)
+        await cb.answer(f"Support is now {'ON' if new_status else 'OFF'}", show_alert=True)
+
+    # 3. USER FEATURES
+    elif data == "user_support":
+        status = await settings_col.find_one({"type": "support_status"})
+        if status and not status.get('active'):
+            await cb.answer("❌ Support is currently offline. Try again later.", show_alert=True)
+        else:
+            await cb.message.reply_text("Connecting to Admin... Please send your message.")
+            await cb.answer()
+
     elif data == "home_menu":
         await cb.message.edit_text("💎 **Main Menu** 💎", reply_markup=main_menu(user_id == ADMIN_ID))
 
