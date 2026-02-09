@@ -2,15 +2,14 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install dependencies for Pyrogram and encryption
 RUN apt-get update && apt-get install -y gcc python3-dev
 
-# Copy requirements and install
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# COPY EVERYTHING from your repo to the /app folder
+# This line is crucial—it copies your bot.py into /app
 COPY . .
 
-# Run the bot
+# Ensure the filename here matches your script exactly
 CMD ["python", "bot.py"]
