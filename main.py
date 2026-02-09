@@ -100,14 +100,7 @@ def get_channel_id_from_link(link):
     return None
 
 # ================= STATES =================
-(
-    CONTENT_INPUT, 
-    BC_PHOTO, BC_TEXT, BC_TIME, 
-    WEL_MEDIA, WEL_TEXT, 
-    UPD_LINK, 
-    F_MEDIA, F_TEXT, F_LINKS, 
-    BTN_TXT
-) = range(11) # Fixed: range(11) because there are 11 variables above
+(CONTENT_INPUT, BC_PHOTO, BC_TEXT, BC_BTNS, BC_TIME, WEL_MEDIA, WEL_TEXT, UPD_LINK, F_MEDIA, F_TEXT, F_LINKS, BTN_TXT) = range(12)
 
 # ================= ADMIN =================
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -152,22 +145,26 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # A. LINKS
     links = re.findall(r'(https?://t\.me/[^\s]+)', txt)
     if links:
+        # Batch
         if len(links) >= 2:
             c1, m1 = parse_link(links[0])
             c2, m2 = parse_link(links[1])
+            
             if not c1 or not c2 or c1 != c2:
                 await update.message.reply_text("❌ Error: Links must be from the same channel.", reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
             
             try: await context.bot.copy_message(ADMIN_ID, c1, m1)
             except Exception as e:
-                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nI cannot access the Start Message.\nMake sure I am Admin in that channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nBot must be Admin.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
 
+            # IMPORTANT: Save end_id for batch processing
             await db.save_content(uid, 'batch', c1, m1, end_id=m2)
             await update.message.reply_text(f"✅ <b>Batch Saved!</b> ({m2-m1+1} files)\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
 
+        # Single
         elif len(links) == 1:
             c_id, m_id = parse_link(links[0])
             if not c_id:
@@ -197,7 +194,7 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ <b>File Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
     
-    await update.message.reply_text("❌ Unknown format. Send Link or File.", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("❌ Unknown format.", reply_markup=InlineKeyboardMarkup(kb))
     return CONTENT_INPUT
 
 # --- BROADCAST ---
@@ -248,8 +245,7 @@ async def cast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run_broadcast(context):
     data = context.user_data
     users = await db.get_all_users()
-    photo = data.get('bc_photo')
-    text = data.get('bc_text')
+    photo, text = data.get('bc_photo'), data.get('bc_text')
     for uid in users:
         try:
             if photo: await context.bot.send_photo(uid, photo, caption=text)
@@ -425,9 +421,7 @@ async def flow_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_force_join(update, context):
     uid = update.effective_user.id
-    
     channels = await db.get_force_channels()
-    # Force Join shows for EVERYONE (if set)
     if channels:
         f_txt = await db.get_setting('f_txt') or "Join these to access files:"
         f_ph = await db.get_setting('f_ph')
@@ -456,8 +450,24 @@ async def deliver(update, context, uid):
     
     try:
         msgs = []
-        if data['type'] == 'single':
-            # Priority: Try File ID
+        # BATCH DELIVERY FIX
+        if data['type'] == 'batch':
+            await context.bot.send_message(uid, "📂 <b>Sending Batch...</b>", parse_mode=ParseMode.HTML)
+            start = data['msg']
+            end = data['end']
+            
+            # Use a loop to send all messages in the range
+            for i in range(start, end + 1):
+                try:
+                    # Copy each message in the batch range
+                    m = await context.bot.copy_message(uid, data['src'], i)
+                    msgs.append(m.message_id)
+                    # Small delay to prevent flood limits
+                    await asyncio.sleep(0.5) 
+                except Exception as e:
+                    pass # Skip if a single message fails (deleted/unavailable)
+
+        elif data['type'] == 'single':
             if data.get('fid'):
                 ftype, cap = data.get('ftype', 'doc'), data.get('cap', "")
                 if ftype == 'video': m = await context.bot.send_video(uid, data['fid'], caption=cap)
@@ -468,20 +478,14 @@ async def deliver(update, context, uid):
             else:
                 m = await context.bot.copy_message(uid, data['src'], data['msg'], caption=data.get('cap', ""))
                 msgs.append(m.message_id)
-                
-        elif data['type'] == 'batch':
-            await context.bot.send_message(uid, "📂 <b>Sending Batch...</b>", parse_mode=ParseMode.HTML)
-            for i in range(data['msg'], data['end'] + 1):
-                try:
-                    m = await context.bot.copy_message(uid, data['src'], i)
-                    msgs.append(m.message_id)
-                    await asyncio.sleep(0.05)
-                except: pass
         
         info = await context.bot.send_message(uid, "⚠️ <b>Files auto-delete in 30 mins.</b>\nLink works permanently.", parse_mode=ParseMode.HTML)
         msgs.append(info.message_id)
         
-        for m_id in msgs: context.job_queue.run_once(del_msg, 1800, data={'c': uid, 'm': m_id})
+        # AUTO DELETE FIX: Loop through ALL sent messages
+        for m_id in msgs: 
+            context.job_queue.run_once(del_msg, 1800, data={'c': uid, 'm': m_id})
+            
     except Exception as e: await context.bot.send_message(uid, f"❌ <b>Error:</b> {e}", parse_mode=ParseMode.HTML)
 
 # ================= SUPPORT =================
