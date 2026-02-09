@@ -4,3 +4,4 @@ motor
 dnspython
 flask
 pytz
+requests
