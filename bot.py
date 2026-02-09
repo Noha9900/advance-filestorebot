@@ -2,14 +2,14 @@ import os
 import asyncio
 import pytz
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from motor.motor_asyncio import AsyncIOMotorClient
 from flask import Flask
 from threading import Thread
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 API_ID = int(os.environ.get("API_ID", "12345"))
 API_HASH = os.environ.get("API_HASH", "your_api_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
@@ -20,118 +20,133 @@ PORT = os.environ.get("PORT", "8080")
 bot = Client("FileStoreBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 db_client = AsyncIOMotorClient(MONGO_URL)
 db = db_client["TelegramBot"]
-users_col = db["users"]
-settings_col = db["settings"]
-files_col = db["files"]
+users_col, settings_col, files_col = db["users"], db["settings"], db["files"]
 
-IST = pytz.timezone('Asia/Kolkata')
-
+# --- FLASK ---
 app = Flask(__name__)
 @app.route('/')
-def health_check(): return "Bot is Active", 200
+def health(): return "Bot Active", 200
+def run_flask(): app.run(host="0.0.0.0", port=int(PORT))
 
-def run_flask():
-    app.run(host="0.0.0.0", port=int(PORT))
-
+# --- UI ---
 def main_menu(is_admin=False):
     if is_admin:
-        buttons = [
-            [InlineKeyboardButton("📂 File Store", callback_data="file_store"),
-             InlineKeyboardButton("📦 Batch Store", callback_data="batch_store")],
-            [InlineKeyboardButton("🎧 Support Chat", callback_data="user_support")],
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📂 File Store", callback_data="file_store"), InlineKeyboardButton("📦 Batch Store", callback_data="batch_store")],
+            [InlineKeyboardButton("🎧 Support Chat", callback_data="admin_support_list")],
             [InlineKeyboardButton("⚙️ Admin Panel ⚙️", callback_data="admin_panel")]
-        ]
-    else:
-        buttons = [[InlineKeyboardButton("🎧 Support Chat", callback_data="user_support")]]
-    return InlineKeyboardMarkup(buttons)
+        ])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Support Chat", callback_data="user_support")]])
 
-# --- FSUB CHECK ---
+# --- FSUB ---
 async def check_fsub(user_id):
     fsub = await settings_col.find_one({"type": "fsub"})
     if not fsub or not fsub.get("channel"): return True
     try:
-        member = await bot.get_chat_member(fsub["channel"], user_id)
-        return member.status not in [enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED]
+        m = await bot.get_chat_member(fsub["channel"], user_id)
+        return m.status not in [enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED]
     except: return False
 
 @bot.on_message(filters.command("start"))
-async def start_cmd(client, message):
-    user_id = message.from_user.id
-    # Link Handling
-    if len(message.command) > 1:
-        if not await check_fsub(user_id):
-            return await message.reply("❌ Join channel first!")
-        file_data = await files_col.find_one({"file_id": message.command[1]})
-        if file_data:
-            msg = await bot.copy_message(user_id, ADMIN_ID, file_data["msg_id"])
-            asyncio.create_task(file_auto_delete(user_id, msg.id))
+async def start_cmd(c, m):
+    uid = m.from_user.id
+    if len(m.command) > 1:
+        if not await check_fsub(uid): return await m.reply("❌ Join channel first!")
+        data = await files_col.find_one({"file_id": m.command[1]})
+        if data:
+            for msg_id in data["msg_ids"]:
+                sent = await c.copy_message(uid, ADMIN_ID, msg_id)
+                asyncio.create_task(file_auto_delete(uid, sent.id))
             return
 
-    await users_col.update_one({"id": user_id}, {"$set": {"name": message.from_user.first_name}}, upsert=True)
-    welcome = await settings_col.find_one({"type": "welcome"})
-    if welcome:
-        sent_msg = await message.reply_photo(photo=welcome['photo'], caption=welcome['text']) if welcome.get('photo') else await message.reply_text(welcome['text'])
-        asyncio.get_event_loop().call_later(welcome.get('seconds', 10), lambda: bot.delete_messages(message.chat.id, sent_msg.id))
-    
-    await message.reply_text("💎 **Main Menu** 💎", reply_markup=main_menu(user_id == ADMIN_ID))
+    await users_col.update_one({"id": uid}, {"$set": {"name": m.from_user.first_name}}, upsert=True)
+    w = await settings_col.find_one({"type": "welcome"})
+    if w:
+        try:
+            sm = await m.reply_photo(w['photo'], caption=w['text']) if w.get('photo') else await m.reply_text(w['text'])
+            asyncio.get_event_loop().call_later(w.get('sec', 10), lambda: bot.delete_messages(m.chat.id, sm.id))
+        except: pass
+    await m.reply_text("💎 **Main Menu** 💎", reply_markup=main_menu(uid == ADMIN_ID))
 
 @bot.on_callback_query()
-async def cb_handler(client, cb: CallbackQuery):
-    data = cb.data
-    user_id = cb.from_user.id
+async def cb_handler(c, cb: CallbackQuery):
+    data, uid = cb.data, cb.from_user.id
 
-    if data == "admin_panel" and user_id == ADMIN_ID:
-        await cb.message.edit_text("🛠 **Admin Control Panel**", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("👋 Welcome Msg", callback_data="set_welcome"), InlineKeyboardButton("📢 Force Join", callback_data="set_fsub")],
-            [InlineKeyboardButton("📡 Broadcast", callback_data="broadcast_opt"), InlineKeyboardButton("📊 Stats", callback_data="view_stats")],
-            [InlineKeyboardButton("🎧 Support: ON/OFF", callback_data="toggle_support")],
+    if data == "admin_panel" and uid == ADMIN_ID:
+        await cb.message.edit_text("🛠 **Admin Panel**", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👋 Set Welcome", callback_data="set_welcome"), InlineKeyboardButton("📢 Set FSub", callback_data="set_fsub")],
+            [InlineKeyboardButton("📊 Stats", callback_data="view_stats"), InlineKeyboardButton("📡 Broadcast", callback_data="broadcast_opt")],
             [InlineKeyboardButton("🔙 Back", callback_data="home_menu")]
         ]))
-    
-    elif data == "file_store" and user_id == ADMIN_ID:
-        await cb.message.reply_text("Send the file to store permanently.")
-        await users_col.update_one({"id": user_id}, {"$set": {"action": "storing"}})
 
-    elif data == "user_support":
-        await cb.message.reply_text("Support Active. Send message (No videos > 3min).", 
-                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ End Chat", callback_data="end_chat")]]))
-        await users_col.update_one({"id": user_id}, {"$set": {"action": "chatting"}})
+    elif data == "batch_store" and uid == ADMIN_ID:
+        await users_col.update_one({"id": uid}, {"$set": {"action": "batch", "batch_ids": []}})
+        await cb.message.reply_text("Send multiple files. Send /done when finished.")
 
-    elif data == "end_chat":
-        await users_col.update_one({"id": user_id}, {"$set": {"action": None}})
-        await cb.message.edit_text("Chat Ended.")
+    elif data == "set_welcome" and uid == ADMIN_ID:
+        await users_col.update_one({"id": uid}, {"$set": {"action": "wel_text"}})
+        await cb.message.reply_text("Send the Welcome Text (or /skip).")
+
+    elif data == "set_fsub" and uid == ADMIN_ID:
+        await users_col.update_one({"id": uid}, {"$set": {"action": "fsub_set"}})
+        await cb.message.reply_text("Send Channel Username (e.g. @MyChannel).")
+
+    elif data == "admin_support_list" and uid == ADMIN_ID:
+        users = await users_col.find({"action": "chatting"}).to_list(10)
+        btns = [[InlineKeyboardButton(f"{u['name']} ({u['id']})", callback_data=f"chat_{u['id']}")] for u in users]
+        btns.append([InlineKeyboardButton("🔙 Back", callback_data="home_menu")])
+        await cb.message.edit_text("Select user to chat:", reply_markup=InlineKeyboardMarkup(btns))
+
+    elif data.startswith("chat_") and uid == ADMIN_ID:
+        target = int(data.split("_")[1])
+        await users_col.update_one({"id": uid}, {"$set": {"action": f"replying_{target}"}})
+        await cb.message.reply_text(f"Replying to {target}. Send msg/pic. /end to stop.")
 
     elif data == "home_menu":
-        await cb.message.edit_text("💎 **Main Menu** 💎", reply_markup=main_menu(user_id == ADMIN_ID))
+        await cb.message.edit_text("💎 **Main Menu** 💎", reply_markup=main_menu(uid == ADMIN_ID))
 
-# --- MESSAGE HANDLING (SUPPORT & STORAGE) ---
-@bot.on_message(filters.private & ~filters.command("start"))
-async def handle_messages(client, message):
-    user = await users_col.find_one({"id": message.from_user.id})
-    
-    # Storage Logic
-    if user and user.get("action") == "storing" and message.from_user.id == ADMIN_ID:
-        file_uuid = str(uuid.uuid4())[:8]
-        await files_col.insert_one({"file_id": file_uuid, "msg_id": message.id})
-        await message.reply_text(f"✅ Stored! Shareable Link:\n`https://t.me/{(await bot.get_me()).username}?start={file_uuid}`")
-        await users_col.update_one({"id": ADMIN_ID}, {"$set": {"action": None}})
+@bot.on_message(filters.private & ~filters.command(["start", "done", "end"]))
+async def handle_msgs(c, m):
+    uid = m.from_user.id
+    u = await users_col.find_one({"id": uid})
+    action = u.get("action") if u else None
 
-    # Support Logic
-    elif user and user.get("action") == "chatting":
-        if message.from_user.id == ADMIN_ID:
-            # Admin replying to user (Assuming you reply to forwarded message)
-            if message.reply_to_message and message.reply_to_message.forward_from:
-                target_id = message.reply_to_message.forward_from.id
-                await bot.copy_message(target_id, ADMIN_ID, message.id)
-        else:
-            if message.video and message.video.duration > 180:
-                return await message.reply("❌ Videos over 3 mins not allowed.")
-            await bot.forward_messages(ADMIN_ID, message.chat.id, message.id)
-            await message.reply("📨 Sent to Admin.")
+    if action == "batch" and uid == ADMIN_ID:
+        await users_col.update_one({"id": uid}, {"$push": {"batch_ids": m.id}})
+        await m.reply("✅ Added to batch.")
 
-async def file_auto_delete(chat_id, message_id):
+    elif action == "wel_text" and uid == ADMIN_ID:
+        await settings_col.update_one({"type": "welcome"}, {"$set": {"text": m.text}}, upsert=True)
+        await users_col.update_one({"id": uid}, {"$set": {"action": "wel_photo"}})
+        await m.reply("Now send a photo (or /skip).")
+
+    elif action == "fsub_set" and uid == ADMIN_ID:
+        await settings_col.update_one({"type": "fsub"}, {"$set": {"channel": m.text}}, upsert=True)
+        await users_col.update_one({"id": uid}, {"$set": {"action": None}})
+        await m.reply(f"✅ FSub set to {m.text}")
+
+    elif action and action.startswith("replying_") and uid == ADMIN_ID:
+        target = int(action.split("_")[1])
+        await c.copy_message(target, ADMIN_ID, m.id)
+        await m.reply("✅ Sent.")
+
+    elif action == "chatting":
+        if m.video and m.video.duration > 180: return await m.reply("❌ Limit 3 min.")
+        await c.forward_messages(ADMIN_ID, m.chat.id, m.id)
+        await m.reply("📨 Sent to Admin.")
+
+@bot.on_message(filters.command("done") & filters.user(ADMIN_ID))
+async def batch_done(c, m):
+    u = await users_col.find_one({"id": ADMIN_ID})
+    if u and u.get("batch_ids"):
+        fid = str(uuid.uuid4())[:8]
+        await files_col.insert_one({"file_id": fid, "msg_ids": u["batch_ids"]})
+        await m.reply(f"📦 Batch stored!\n`https://t.me/{(await c.get_me()).username}?start={fid}`")
+    await users_col.update_one({"id": ADMIN_ID}, {"$set": {"action": None, "batch_ids": []}})
+
+async def file_auto_delete(cid, mid):
     await asyncio.sleep(1800)
-    try: await bot.delete_messages(chat_id, message_id)
+    try: await bot.delete_messages(cid, mid)
     except: pass
 
 if __name__ == "__main__":
