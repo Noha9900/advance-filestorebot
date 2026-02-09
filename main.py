@@ -45,11 +45,6 @@ class Database:
         if user_id == ADMIN_ID:
             await self.settings.update_one({'_id': 'admin_stat'}, {'$set': {'seen': datetime.now()}}, upsert=True)
 
-    async def is_admin_online(self):
-        doc = await self.settings.find_one({'_id': 'admin_stat'})
-        if not doc: return False
-        return (datetime.now() - doc['seen']).total_seconds() < 600
-
     async def get_all_users(self):
         cursor = self.users.find({})
         return [doc['_id'] async for doc in cursor]
@@ -57,7 +52,6 @@ class Database:
     async def get_stats(self): return await self.users.count_documents({})
 
     async def save_content(self, uid, ctype, chat_id, msg_id, end_id=None, caption="", file_id=None, file_type=None):
-        # Storing File ID is crucial for restricted content
         await self.content.insert_one({
             '_id': uid, 'type': ctype, 'src': chat_id, 'msg': msg_id, 'end': end_id, 
             'cap': caption, 'fid': file_id, 'ftype': file_type,
@@ -88,8 +82,10 @@ def build_menu(buttons, n_cols=2, footer_buttons=None):
     return menu
 
 def parse_link(link):
+    # Private Channel: https://t.me/c/123456789/100 -> ID: -100123456789
     m = re.search(r't\.me/c/(\d+)/(\d+)', link)
     if m: return int("-100" + m.group(1)), int(m.group(2))
+    # Public Channel: https://t.me/Username/100 -> ID: @Username
     m = re.search(r't\.me/([\w\d_]+)/(\d+)', link)
     if m: return "@" + m.group(1), int(m.group(2))
     return None, None
@@ -109,8 +105,8 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.add_user(ADMIN_ID, "Admin", "Admin")
     
     btns = [
-        InlineKeyboardButton("➕ Content", callback_data="m_add"), InlineKeyboardButton("📢 Broadcast", callback_data="m_cast"),
-        InlineKeyboardButton("📝 Welcome", callback_data="m_wel"), InlineKeyboardButton("🔔 Upd Channel", callback_data="m_upd"),
+        InlineKeyboardButton("➕ Add Content", callback_data="m_add"), InlineKeyboardButton("📢 Broadcast", callback_data="m_cast"),
+        InlineKeyboardButton("📝 Set Welcome", callback_data="m_wel"), InlineKeyboardButton("🔔 Upd Channel", callback_data="m_upd"),
         InlineKeyboardButton("🛡️ Force Join", callback_data="m_force"), InlineKeyboardButton("🔘 Buttons", callback_data="m_btn"),
         InlineKeyboardButton("📊 Stats", callback_data="stats")
     ]
@@ -125,62 +121,88 @@ async def back_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     return await cmd_admin(update, context)
 
-# --- ADD CONTENT (FIXED) ---
+# --- ADD CONTENT (FIXED FOR LINKS & BATCH) ---
 async def m_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
-    await update.callback_query.edit_message_text("<b>Send File / Link / Batch:</b>\n\n1. Forward File (Works for Restricted)\n2. Send Link\n3. `Batch Link1 Link2`", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+    await update.callback_query.edit_message_text(
+        "<b>Send Content:</b>\n\n"
+        "1. <b>Forward File</b> (Easiest)\n"
+        "2. <b>Single Link:</b> `https://t.me/c/xxx/100`\n"
+        "3. <b>Batch (Range):</b> `https://t.me/c/xxx/100 https://t.me/c/xxx/105`\n\n"
+        "⚠️ <i>For links, I must be Admin in that channel!</i>",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
+    )
     return CONTENT_IN
 
 async def h_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg, txt = update.message, update.message.text or ""
+    msg = update.message
+    txt = msg.text or msg.caption or ""
     uid = str(uuid.uuid4())[:8]
     kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
 
-    # Batch
-    if txt.lower().startswith("batch"):
-        try:
-            parts = txt.split()
-            c1, m1 = parse_link(parts[1])
-            c2, m2 = parse_link(parts[2])
-            if c1 != c2: raise ValueError
-            await db.save_content(uid, 'batch', c1, m1, end_id=m2)
-            await update.message.reply_text(f"Batch: https://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
-            return ConversationHandler.END
-        except: return await update.message.reply_text("Error: `Batch Link1 Link2`", reply_markup=InlineKeyboardMarkup(kb))
-
-    # Single Link
-    c_id, m_id = parse_link(txt)
-    if c_id:
-        await db.save_content(uid, 'single', c_id, m_id)
-        await update.message.reply_text(f"Link: https://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
-        return ConversationHandler.END
-
-    # File Forward (Fix: Capture File ID)
-    if msg:
-        file_id, file_type = None, None
-        if msg.document: file_id, file_type = msg.document.file_id, 'doc'
-        elif msg.video: file_id, file_type = msg.video.file_id, 'video'
-        elif msg.photo: file_id, file_type = msg.photo[-1].file_id, 'photo'
-        elif msg.audio: file_id, file_type = msg.audio.file_id, 'audio'
-        
-        if file_id:
-            # Save using Current Chat ID (Admin DM) as source
-            src = msg.chat_id
-            await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption, file_id=file_id, file_type=file_type)
-            await update.message.reply_text(f"Link: https://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
-            return ConversationHandler.END
+    # 1. Check for Links
+    links = re.findall(r'(https?://t\.me/[^\s]+)', txt)
     
-    await update.message.reply_text("❌ Unknown content. Send Link or File.", reply_markup=InlineKeyboardMarkup(kb))
+    if links:
+        # A. BATCH (2 Links)
+        if len(links) >= 2:
+            start_link = links[0]
+            end_link = links[1]
+            c1, m1 = parse_link(start_link)
+            c2, m2 = parse_link(end_link)
+            
+            if not c1 or not c2 or c1 != c2:
+                await update.message.reply_text("❌ Error: Links must be from the same channel.", reply_markup=InlineKeyboardMarkup(kb))
+                return CONTENT_IN
+                
+            # Verify Access
+            try:
+                await context.bot.copy_message(ADMIN_ID, c1, m1)
+            except Exception as e:
+                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nI cannot access the Start Message.\nMake sure I am Admin in that channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                return CONTENT_IN
+
+            await db.save_content(uid, 'batch', c1, m1, end_id=m2)
+            await update.message.reply_text(f"✅ <b>Batch Saved!</b> ({m2-m1+1} files)\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
+            return ConversationHandler.END
+
+        # B. SINGLE LINK
+        elif len(links) == 1:
+            c_id, m_id = parse_link(links[0])
+            if not c_id:
+                await update.message.reply_text("❌ Invalid Link Format.", reply_markup=InlineKeyboardMarkup(kb))
+                return CONTENT_IN
+                
+            # Verify Access
+            try:
+                await context.bot.copy_message(ADMIN_ID, c_id, m_id)
+            except Exception as e:
+                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nI cannot access that message.\nMake sure I am Admin in that channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                return CONTENT_IN
+
+            await db.save_content(uid, 'single', c_id, m_id)
+            await update.message.reply_text(f"✅ <b>Link Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
+            return ConversationHandler.END
+
+    # C. FILE FORWARD (Fallback)
+    if msg.forward_from_chat or msg.chat_id:
+        # Use the chat where the message currently EXISTS (The bot's DM)
+        # We save the file from the Admin's chat history with the bot
+        src = msg.chat_id 
+        await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption)
+        await update.message.reply_text(f"✅ <b>File Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
+        return ConversationHandler.END
+    
+    await update.message.reply_text("❌ Unknown format. Send Link(s) or File.", reply_markup=InlineKeyboardMarkup(kb))
     return CONTENT_IN
 
-# --- BROADCAST (FIXED) ---
+# --- BROADCAST ---
 async def m_cast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text("<b>Broadcast: Send Photo</b> (or Skip)", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     return BC_PHOTO
 
 async def h_bc_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Fix: Handle both skip callback and message upload
     if update.callback_query and update.callback_query.data == "skip":
         context.user_data['bc_photo'] = None
         await update.callback_query.answer()
@@ -203,7 +225,6 @@ async def h_bc_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     kb = [[InlineKeyboardButton("🚀 Send Now", callback_data="now"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
     txt = "<b>Ready to Send?</b>"
-    
     if update.message: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     else: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     return BC_TIME
@@ -229,7 +250,7 @@ async def run_broadcast(context):
             await asyncio.sleep(0.05)
         except: pass
 
-# --- FORCE JOIN SETTINGS (FIXED) ---
+# --- FORCE JOIN SETTINGS ---
 async def m_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🗑️ Delete All Links", callback_data="del_force")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text("Send <b>Force Join Photo</b> (or /cancel).", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
@@ -269,7 +290,7 @@ async def save_f_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Saved.", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-# --- UPDATE CHANNEL (Settings) ---
+# --- UPDATE CHANNEL ---
 async def m_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     curr = await db.get_setting('upd_link')
     txt = f"Current: {curr}" if curr else "None"
@@ -289,7 +310,7 @@ async def del_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text("🗑️ Deleted.", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
-# --- WELCOME SETTINGS ---
+# --- WELCOME ---
 async def m_wel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🗑️ Delete", callback_data="del_wel")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text("Send <b>Welcome Photo</b>.", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
@@ -354,8 +375,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 m = await context.bot.get_chat_member(cid, uid)
                 if m.status in ['left', 'kicked']: is_member = False
-            except: is_member = False # Assume not joined if cant check
-        elif not context.user_data.get('upd_verified'): is_member = False
+            except: is_member = False
+        else:
+            if not context.user_data.get('upd_verified'): is_member = False
 
     if not is_member and upd_link:
         w_txt = await db.get_setting('w_txt') or "Welcome!"
@@ -428,21 +450,10 @@ async def deliver(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         msgs = []
         if data['type'] == 'single':
-            # Priority: Try File ID first (Bypasses Restrictions)
-            if data.get('fid'):
-                ftype = data.get('ftype', 'doc')
-                cap = data.get('cap', "")
-                if ftype == 'video': m = await context.bot.send_video(uid, data['fid'], caption=cap)
-                elif ftype == 'photo': m = await context.bot.send_photo(uid, data['fid'], caption=cap)
-                elif ftype == 'audio': m = await context.bot.send_audio(uid, data['fid'], caption=cap)
-                else: m = await context.bot.send_document(uid, data['fid'], caption=cap)
-                msgs.append(m.message_id)
-            else:
-                m = await context.bot.copy_message(uid, data['src'], data['msg'], caption=data.get('cap', ""))
-                msgs.append(m.message_id)
-                
+            m = await context.bot.copy_message(uid, data['src'], data['msg'], caption=data.get('cap', ""))
+            msgs.append(m.message_id)
         elif data['type'] == 'batch':
-            await context.bot.send_message(uid, "📂 <b>Sending Batch...</b>", parse_mode=ParseMode.HTML)
+            await context.bot.send_message(uid, f"📂 <b>Batch Found!</b>\nSending {data['end'] - data['msg'] + 1} files...", parse_mode=ParseMode.HTML)
             for i in range(data['msg'], data['end'] + 1):
                 try:
                     m = await context.bot.copy_message(uid, data['src'], i)
@@ -450,12 +461,12 @@ async def deliver(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await asyncio.sleep(0.05)
                 except: pass
         
-        info = await context.bot.send_message(uid, "⚠️ <b>Files auto-delete in 30 mins.</b>\nLink works permanently.", parse_mode=ParseMode.HTML)
+        info = await context.bot.send_message(uid, "⚠️ <b>Files disappear in 30 mins.</b>\nLink works permanently.", parse_mode=ParseMode.HTML)
         msgs.append(info.message_id)
         
         for m_id in msgs: context.job_queue.run_once(del_msg, 1800, data={'c': uid, 'm': m_id})
     except Exception as e: 
-        await context.bot.send_message(uid, f"❌ <b>Error:</b> Bot cannot access file. {e}", parse_mode=ParseMode.HTML)
+        await context.bot.send_message(uid, f"❌ <b>Error:</b> Bot cannot access file. Ensure Bot is Admin in source channel.\n{e}", parse_mode=ParseMode.HTML)
 
 # ================= SUPPORT =================
 async def start_supp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,8 +477,7 @@ async def start_supp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(uid, "✅ <b>Connected to Admin!</b>\nSend Text/Media.\nTap 'End Chat' to close.", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     
     u = update.effective_user
-    akb = [[InlineKeyboardButton("End Chat", callback_data=f"end_admin_{uid}")]]
-    await context.bot.send_message(ADMIN_ID, f"🚨 <b>Support:</b> {u.first_name} (ID: {uid})", reply_markup=InlineKeyboardMarkup(akb), parse_mode=ParseMode.HTML)
+    await context.bot.send_message(ADMIN_ID, f"🚨 <b>Support:</b> {u.first_name} (ID: {uid})", parse_mode=ParseMode.HTML)
 
 async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -496,16 +506,10 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.copy_message(ADMIN_ID, uid, msg.message_id, caption=caption_txt)
 
 async def end_supp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = update.callback_query.data
-    if d == "end_supp":
-        await db.support.update_one({'_id': update.effective_user.id}, {'$set': {'on': False}})
-        await update.callback_query.edit_message_text("❌ Chat Ended.")
-        await context.bot.send_message(ADMIN_ID, f"User {update.effective_user.id} ended chat.")
-    else:
-        tgt = int(d.split("_")[2])
-        await db.support.update_one({'_id': tgt}, {'$set': {'on': False}})
-        await update.callback_query.edit_message_text("❌ Ended.")
-        await context.bot.send_message(tgt, "❌ Admin ended the chat.")
+    uid = update.effective_user.id
+    await db.support.update_one({'_id': uid}, {'$set': {'on': False}})
+    await update.callback_query.edit_message_text("❌ Chat Ended.")
+    await context.bot.send_message(ADMIN_ID, f"User {uid} ended chat.")
 
 async def del_msg(context: ContextTypes.DEFAULT_TYPE):
     try: await context.bot.delete_message(context.job.data['c'], context.job.data['m'])
@@ -549,13 +553,14 @@ def main():
     app.add_handler(CallbackQueryHandler(back_home, pattern="back"))
     
     app.add_handler(CallbackQueryHandler(start_supp, pattern="supp"))
-    app.add_handler(CallbackQueryHandler(end_supp, pattern="^end_")) # Matches end_supp and end_admin_123
+    app.add_handler(CallbackQueryHandler(end_supp, pattern="end_supp"))
     
     app.add_handler(CallbackQueryHandler(chk_upd_cb, pattern="chk_upd"))
     app.add_handler(CallbackQueryHandler(chk_force_cb, pattern="chk_force"))
     app.add_handler(CallbackQueryHandler(stats_cb, pattern="stats"))
     
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_chat))
+    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    app.add_handler(MessageHandler(filters.ALL, handle_msg))
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
