@@ -19,7 +19,6 @@ db = AsyncIOMotorClient(MONGO_URL).FileStoreBot
 scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
 admin_states = {} 
-batch_temp = {}   
 
 # --- KEYBOARDS ---
 def glass_markup(rows):
@@ -37,98 +36,127 @@ def get_admin_main():
 async def get_config():
     config = await db.settings.find_one({"id": "config"})
     if not config:
-        config = {"id": "config", "support_active": True, "welcome_enabled": False, "fjoin_channels": [], "welcome_text": "Welcome {name}!", "welcome_sec": 10}
+        config = {
+            "id": "config", 
+            "support_active": True, 
+            "welcome_enabled": False, 
+            "fjoin_channels": [], 
+            "fjoin_text": "Join our channels to continue!",
+            "welcome_sec": 10
+        }
         await db.settings.insert_one(config)
     return config
+
+# --- FORCE JOIN CHECKER ---
+async def is_subscribed(client, user_id):
+    config = await get_config()
+    channels = config.get("fjoin_channels", [])
+    if not channels: return True
+    for chat_id in channels:
+        try:
+            member = await client.get_chat_member(chat_id, user_id)
+            if member.status in ["left", "kicked"]: return False
+        except Exception: return False
+    return True
 
 # --- ADMIN CALLBACK HANDLERS ---
 @app.on_callback_query(filters.user(ADMINS))
 async def handle_admin_callbacks(c, cb: CallbackQuery):
     data = cb.data
-    config = await get_config()
-
     if data == "main_admin":
         await cb.message.edit_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
-
+    elif data == "set_fjoin":
+        admin_states[cb.from_user.id] = {"state": "waiting_fjoin_ids"}
+        await cb.message.edit_text("📢 **Step 1:** Send Channel IDs separated by commas.\nExample: `-100123,-100456`",
+                                   reply_markup=glass_markup([[("❌ Cancel", "main_admin")]]))
     elif data == "set_welcome":
         admin_states[cb.from_user.id] = {"state": "waiting_welcome_photo"}
-        await cb.message.edit_text("🖼 **Step 1:** Send the Welcome Photo.\nOr click Skip to use text only.",
+        await cb.message.edit_text("🖼 **Welcome Step 1:** Send Photo or Skip.",
                                    reply_markup=glass_markup([[("⏩ Skip", "skip_photo")], [("❌ Cancel", "main_admin")]]))
-
-    elif data == "skip_photo":
-        admin_states[cb.from_user.id] = {"state": "waiting_welcome_text"}
-        await db.settings.update_one({"id": "config"}, {"$set": {"welcome_photo": None}})
-        await cb.message.edit_text("📝 **Step 2:** Send the Welcome Text.\nUse `{name}` for the user's name.",
-                                   reply_markup=glass_markup([[("❌ Cancel", "main_admin")]]))
-
-    elif data == "stats":
-        u_count = await db.users.count_documents({})
-        b_count = await db.batches.count_documents({})
-        await cb.message.edit_text(f"📊 **Stats**\n\nUsers: `{u_count}`\nBatches: `{b_count}`", 
-                                   reply_markup=glass_markup([[("⬅️ Back", "main_admin")]]))
-
     elif data == "delete_msg":
         await cb.message.delete()
 
-# --- ADMIN INPUT LOGIC ---
+# --- INPUT PROCESSOR (Logic for Admin Settings) ---
 @app.on_message(filters.user(ADMINS) & filters.private)
 async def admin_input_processor(c, m):
     uid = m.from_user.id
     if uid not in admin_states: return
+    state = admin_states[uid]["state"]
 
-    state_data = admin_states[uid]
-    current_state = state_data.get("state")
+    if state == "waiting_fjoin_ids":
+        try:
+            ids = [int(i.strip()) for i in m.text.split(",")]
+            await db.settings.update_one({"id": "config"}, {"$set": {"fjoin_channels": ids}})
+            admin_states[uid] = {"state": "waiting_fjoin_text"}
+            await m.reply("✅ IDs Saved. Now send the **Force Join Text** (HTML supported).")
+        except: await m.reply("❌ Invalid IDs. Use: `-100123, -100456`")
+    
+    elif state == "waiting_fjoin_text":
+        await db.settings.update_one({"id": "config"}, {"$set": {"fjoin_text": m.text}})
+        await m.reply("✅ Force Join Updated!", reply_markup=get_admin_main())
+        del admin_states[uid]
 
-    if current_state == "waiting_welcome_photo":
-        if m.photo:
-            photo_id = m.photo.file_id
-            await db.settings.update_one({"id": "config"}, {"$set": {"welcome_photo": photo_id}})
-            admin_states[uid] = {"state": "waiting_welcome_text"}
-            await m.reply("✅ Photo saved! Now send the **Welcome Text**.")
-        else:
-            await m.reply("❌ Please send a photo or click Skip.")
-
-    elif current_state == "waiting_welcome_text":
-        await db.settings.update_one({"id": "config"}, {"$set": {"welcome_text": m.text, "welcome_enabled": True}})
-        admin_states[uid] = {"state": "waiting_welcome_sec"}
-        await m.reply("📝 Text saved! Now send the **Auto-delete time** in seconds (e.g., 10).")
-
-    elif current_state == "waiting_welcome_sec":
+    elif state == "waiting_welcome_sec":
         if m.text.isdigit():
             await db.settings.update_one({"id": "config"}, {"$set": {"welcome_sec": int(m.text)}})
-            await m.reply(f"✅ Welcome settings completed! (Timer: {m.text}s)", reply_markup=get_admin_main())
+            await m.reply(f"✅ Timer set to {m.text}s.", reply_markup=get_admin_main())
             del admin_states[uid]
-        else:
-            await m.reply("❌ Please send a number.")
 
-# --- USER START & WELCOME ---
+# --- USER GATEWAY (The Start Handler) ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(c, m):
-    await db.users.update_one({"id": m.from_user.id}, {"$set": {"active": True}}, upsert=True)
     config = await get_config()
-
-    # Welcome Logic
+    user_id = m.from_user.id
+    
+    # 1. Welcome Phase
     if config.get("welcome_enabled"):
-        welcome_text = config.get("welcome_text", "Welcome!").replace("{name}", m.from_user.first_name)
-        photo = config.get("welcome_photo")
+        w_text = config.get("welcome_text", "Welcome!").replace("{name}", m.from_user.first_name)
+        w_photo = config.get("welcome_photo")
         
-        if photo:
-            msg = await m.reply_photo(photo, caption=welcome_text)
-        else:
-            msg = await m.reply_text(welcome_text)
-            
-        # Timer for disappearance
-        sec = config.get("welcome_sec", 10)
-        scheduler.add_job(lambda: msg.delete(), "date", run_date=datetime.now() + timedelta(seconds=sec))
+        if w_photo: msg = await m.reply_photo(w_photo, caption=w_text)
+        else: msg = await m.reply_text(w_text)
+        
+        # Immediate timer for disappearance
+        async def auto_del(message, delay):
+            await asyncio.sleep(delay)
+            try: await message.delete()
+            except: pass
+        
+        asyncio.create_task(auto_del(msg, config.get("welcome_sec", 10)))
 
-# --- PORT & SERVER ---
-async def keep_alive(request): return web.Response(text="Bot Active")
+    # 2. Force Join Check
+    if not await is_subscribed(c, user_id):
+        # Once welcome disappears, user sees this
+        await asyncio.sleep(config.get("welcome_sec", 10))
+        buttons = []
+        for cid in config.get("fjoin_channels", []):
+            try:
+                chat = await c.get_chat(cid)
+                buttons.append([InlineKeyboardButton(f"Join {chat.title}", url=chat.invite_link or "https://t.me")])
+            except: continue
+        
+        return await m.reply_text(config.get("fjoin_text"), reply_markup=InlineKeyboardMarkup(buttons))
+
+    # 3. Handle Batch File Links
+    if "batch_" in m.text:
+        b_id = m.text.split("_")[1]
+        data = await db.batches.find_one({"batch_id": b_id})
+        if data:
+            sent = []
+            for f in data['files']:
+                s = await c.send_cached_media(m.chat.id, f)
+                sent.append(s.id)
+            
+            # 30-minute auto delete
+            scheduler.add_job(lambda: c.delete_messages(m.chat.id, sent), "date", 
+                              run_date=datetime.now() + timedelta(minutes=30))
+            await m.reply("⏳ Files will be deleted in 30 minutes for security.")
+
+# --- SERVER ---
 async def main():
     if not scheduler.running: scheduler.start()
-    server = web.AppRunner(web.Application())
-    await server.setup()
-    await web.TCPSite(server, "0.0.0.0", PORT).start()
     await app.start()
+    # Web server logic for Render...
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
