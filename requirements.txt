@@ -4,6 +4,4 @@ motor
 pymongo[srv]
 pytz
 apscheduler
-flask
-gunicorn
 aiohttp
