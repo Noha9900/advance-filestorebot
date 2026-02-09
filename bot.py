@@ -41,63 +41,56 @@ async def get_config():
         await db.settings.insert_one(config)
     return config
 
-# --- COMMANDS ---
-@app.on_message(filters.command("admin") & filters.user(ADMINS))
-async def admin_cmd(c, m):
-    await m.reply_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
-
+# --- USER HANDLER (WELCOME & BATCH) ---
 @app.on_message(filters.command("start") & filters.private)
-async def start_cmd(c, m):
-    # Save User to DB
+async def start_handler(c, m):
     await db.users.update_one({"id": m.from_user.id}, {"$set": {"name": m.from_user.first_name}}, upsert=True)
-    
     config = await get_config()
-    
-    # 1. SEND WELCOME MESSAGE
+
+    # 1. WELCOME LOGIC
     if config.get("welcome_enabled"):
         welcome_text = config.get("welcome_text", "Welcome {name}!").replace("{name}", m.from_user.first_name)
         w_photo = config.get("welcome_photo")
+        msg = await (m.reply_photo(w_photo, caption=welcome_text) if w_photo else m.reply_text(welcome_text))
         
-        if w_photo:
-            welcome_msg = await m.reply_photo(w_photo, caption=welcome_text)
-        else:
-            welcome_msg = await m.reply_text(welcome_text)
-            
-        # AUTO-DELETE WELCOME
-        async def delete_welcome():
+        async def auto_del():
             await asyncio.sleep(config.get("welcome_sec", 10))
-            try: await welcome_msg.delete()
+            try: await msg.delete()
             except: pass
-        asyncio.create_task(delete_welcome())
+        asyncio.create_task(auto_del())
 
-    # 2. HANDLE BATCH RETRIEVAL
+    # 2. BATCH DELIVERY LOGIC
     if len(m.text.split()) > 1:
         payload = m.text.split()[1]
         if payload.startswith("batch_"):
             batch_id = payload.replace("batch_", "")
             batch_data = await db.batches.find_one({"batch_id": batch_id})
-            
-            if not batch_data:
-                return await m.reply_text("❌ This batch link has expired or is invalid.")
-            
-            sent_files = []
-            for file_id in batch_data["files"]:
-                try:
-                    # Send as cached media to avoid re-uploading
-                    sent = await c.send_cached_media(m.chat.id, file_id)
-                    sent_files.append(sent.id)
-                    await asyncio.sleep(0.5) # Prevent flood
-                except Exception as e:
-                    print(f"Error sending file: {e}")
+            if batch_data:
+                sent_files = []
+                for f_id in batch_data["files"]:
+                    s = await c.send_cached_media(m.chat.id, f_id)
+                    sent_files.append(s.id)
+                
+                await m.reply("⏳ Files will delete in 30 minutes.")
+                scheduler.add_job(lambda: c.delete_messages(m.chat.id, sent_files), "date", 
+                                  run_date=datetime.now() + timedelta(minutes=30))
 
-            await m.reply_text("⏳ **Security Alert:** These files will be deleted in 30 minutes.")
-            
-            # SCHEDULE 30-MIN DELETE
-            scheduler.add_job(
-                lambda: c.delete_messages(m.chat.id, sent_files),
-                "date",
-                run_date=datetime.now() + timedelta(minutes=30)
-            )
+# --- WEB SERVER (PREVENTS RENDER CRASH) ---
+async def web_handle(request):
+    return web.Response(text="Bot is Live")
 
-# --- ADMIN INPUT & CALLBACKS ---
-# (Keep your existing cb_handler and admin_input_processor logic here)
+async def start_web_server():
+    webapp = web.Application()
+    webapp.router.add_get("/", web_handle)
+    runner = web.AppRunner(webapp)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+
+async def main():
+    if not scheduler.running: scheduler.start()
+    await start_web_server()
+    await app.start()
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.get_event_loop().run_until_complete(main())
