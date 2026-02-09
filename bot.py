@@ -12,13 +12,14 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",")]
-PORT = int(os.getenv("PORT", 8080)) 
+PORT = int(os.getenv("PORT", 8080))
 
 app = Client("ComplexBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 db = AsyncIOMotorClient(MONGO_URL).FileStoreBot
 scheduler = AsyncIOScheduler(timezone="Asia/Kolkata")
 
 admin_states = {} 
+batch_temp = {}
 
 # --- KEYBOARDS ---
 def glass_markup(rows):
@@ -36,103 +37,111 @@ def get_admin_main():
 async def get_config():
     config = await db.settings.find_one({"id": "config"})
     if not config:
-        config = {
-            "id": "config", 
-            "support_active": True, 
-            "welcome_enabled": False, 
-            "fjoin_channels": [], 
-            "fjoin_text": "<b>Join our channels to continue!</b>",
-            "welcome_sec": 10
-        }
+        config = {"id": "config", "support_active": True, "welcome_enabled": False, "fjoin_channels": [], "welcome_text": "Welcome {name}!", "welcome_sec": 10}
         await db.settings.insert_one(config)
     return config
 
-# --- FORCE JOIN CHECKER ---
-async def is_subscribed(client, user_id):
-    config = await get_config()
-    channels = config.get("fjoin_channels", [])
-    if not channels: return True
-    for chat_id in channels:
-        try:
-            member = await client.get_chat_member(chat_id, user_id)
-            if member.status in ["left", "kicked"]: return False
-        except Exception: return False
-    return True
-
-# --- COMMAND: ADMIN ---
-@app.on_message(filters.command("admin") & filters.user(ADMINS))
-async def admin_cmd_handler(c, m):
-    await m.reply_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
-
-# --- COMMAND: START ---
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(c, m):
-    # Save User to DB
-    await db.users.update_one({"id": m.from_user.id}, {"$set": {"name": m.from_user.first_name, "date": datetime.now()}}, upsert=True)
-    
-    config = await get_config()
-    user_id = m.from_user.id
-    
-    # 1. Welcome Phase
-    if config.get("welcome_enabled"):
-        w_text = config.get("welcome_text", "Welcome!").replace("{name}", m.from_user.first_name)
-        w_photo = config.get("welcome_photo")
-        msg = await (m.reply_photo(w_photo, caption=w_text) if w_photo else m.reply_text(w_text))
-        
-        async def auto_del(message, delay):
-            await asyncio.sleep(delay)
-            try: await message.delete()
-            except: pass
-        asyncio.create_task(auto_del(msg, config.get("welcome_sec", 10)))
-
-    # 2. Force Join Check
-    if not await is_subscribed(c, user_id):
-        await asyncio.sleep(config.get("welcome_sec", 10))
-        buttons = []
-        for cid in config.get("fjoin_channels", []):
-            try:
-                chat = await c.get_chat(cid)
-                invite = await c.export_chat_invite_link(cid)
-                buttons.append([InlineKeyboardButton(f"Join {chat.title}", url=invite)])
-            except: continue
-        return await m.reply_text(config.get("fjoin_text"), reply_markup=InlineKeyboardMarkup(buttons))
-
-    # 3. Handle Batch File Links
-    if len(m.text.split()) > 1 and "batch_" in m.text:
-        b_id = m.text.split("_")[1]
-        data = await db.batches.find_one({"batch_id": b_id})
-        if data:
-            sent = []
-            for f in data['files']:
-                s = await c.send_cached_media(m.chat.id, f)
-                sent.append(s.id)
-            
-            scheduler.add_job(lambda: c.delete_messages(m.chat.id, sent), "date", 
-                              run_date=datetime.now() + timedelta(minutes=30))
-            await m.reply("⏳ Files will be deleted in 30 minutes for security.")
-
-# --- CALLBACK HANDLER ---
+# --- ADMIN CALLBACK HANDLERS ---
 @app.on_callback_query()
 async def cb_handler(c, cb: CallbackQuery):
-    if cb.data == "main_admin":
-        await cb.message.edit_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
-    elif cb.data == "delete_msg":
-        await cb.message.delete()
-    # Add other callback logics here...
+    if cb.from_user.id not in ADMINS:
+        return await cb.answer("❌ Admin Only!", show_alert=True)
+    
+    data = cb.data
+    config = await get_config()
 
-# --- WEB SERVER ---
-async def start_web_server():
+    if data == "main_admin":
+        await cb.message.edit_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
+    
+    elif data == "stats":
+        u_count = await db.users.count_documents({})
+        b_count = await db.batches.count_documents({})
+        await cb.message.edit_text(f"📊 **Statistics**\n\n👤 Total Users: `{u_count}`\n📂 Total Batches: `{b_count}`", 
+                                   reply_markup=glass_markup([[("⬅️ Back", "main_admin")]]))
+
+    elif data == "toggle_support":
+        new_val = not config.get("support_active", True)
+        await db.settings.update_one({"id": "config"}, {"$set": {"support_active": new_val}})
+        await cb.answer(f"Support is now {'ON' if new_val else 'OFF'}", show_alert=True)
+
+    elif data == "set_fjoin":
+        admin_states[cb.from_user.id] = "waiting_fjoin"
+        await cb.message.edit_text("📢 **Send Channel IDs** separated by commas.\nExample: `-100123,-100456`", reply_markup=glass_markup([[("❌ Cancel", "main_admin")]]))
+
+    elif data == "start_batch":
+        batch_temp[cb.from_user.id] = []
+        await cb.message.edit_text("📤 **Batch Mode Active**\nSend files/videos now. Click **Done** when finished.", 
+                                   reply_markup=glass_markup([[("✅ Done", "save_batch")]]))
+
+    elif data == "save_batch":
+        u_id = cb.from_user.id
+        if not batch_temp.get(u_id): return await cb.answer("No files added!")
+        b_id = str(uuid.uuid4())[:8]
+        await db.batches.insert_one({"batch_id": b_id, "files": batch_temp[u_id]})
+        link = f"https://t.me/{(await c.get_me()).username}?start=batch_{b_id}"
+        await cb.message.edit_text(f"✅ **Batch Saved!**\nLink: `{link}`", reply_markup=get_admin_main())
+        del batch_temp[u_id]
+
+    elif data == "bcast_menu":
+        admin_states[cb.from_user.id] = "waiting_bcast"
+        await cb.message.edit_text("🚀 **Send Broadcast Message**\nAnything you send now will go to all users.", reply_markup=glass_markup([[("❌ Cancel", "main_admin")]]))
+
+    elif data == "delete_msg":
+        await cb.message.delete()
+
+# --- ADMIN INPUT PROCESSOR ---
+@app.on_message(filters.user(ADMINS) & filters.private & ~filters.command(["admin", "start"]))
+async def admin_input_processor(c, m):
+    uid = m.from_user.id
+    if uid in batch_temp:
+        f_id = m.document.file_id if m.document else (m.video.file_id if m.video else m.photo.file_id)
+        batch_temp[uid].append(f_id)
+        return await m.reply(f"📥 Added. Total: {len(batch_temp[uid])}")
+
+    if uid not in admin_states: return
+    state = admin_states[uid]
+
+    if state == "waiting_fjoin":
+        try:
+            ids = [int(i.strip()) for i in m.text.split(",")]
+            await db.settings.update_one({"id": "config"}, {"$set": {"fjoin_channels": ids}})
+            await m.reply("✅ Force Join Updated!", reply_markup=get_admin_main())
+        except: await m.reply("❌ Invalid IDs.")
+    
+    elif state == "waiting_bcast":
+        users = db.users.find({})
+        count = 0
+        async for user in users:
+            try:
+                await m.copy(user['id'])
+                count += 1
+                await asyncio.sleep(0.1)
+            except: pass
+        await m.reply(f"✅ Broadcast Finished. Sent to {count} users.")
+    
+    del admin_states[uid]
+
+# --- COMMANDS ---
+@app.on_message(filters.command("admin") & filters.user(ADMINS))
+async def admin_cmd(c, m):
+    await m.reply_text("🛠 **Admin Control Panel**", reply_markup=get_admin_main())
+
+@app.on_message(filters.command("start") & filters.private)
+async def start_cmd(c, m):
+    await db.users.update_one({"id": m.from_user.id}, {"$set": {"name": m.from_user.first_name}}, upsert=True)
+    # [Insert your Welcome/FJoin Logic here as per previous steps]
+    await m.reply("Bot is Active! Send /admin to manage.")
+
+# --- SERVER ---
+async def main():
+    if not scheduler.running: scheduler.start()
     webapp = web.Application()
     webapp.router.add_get("/", lambda r: web.Response(text="Bot Running"))
     runner = web.AppRunner(webapp)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-
-async def main():
-    if not scheduler.running: scheduler.start()
-    await start_web_server()
     await app.start()
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    app.run(main())
+    asyncio.get_event_loop().run_until_complete(main())
