@@ -107,7 +107,7 @@ def get_channel_id_from_link(link):
     UPD_LINK, 
     F_MEDIA, F_TEXT, F_LINKS, 
     BTN_TXT
-) = range(12)
+) = range(11) # Fixed: range(11) because there are 11 variables above
 
 # ================= ADMIN =================
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,11 +161,11 @@ async def handle_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             try: await context.bot.copy_message(ADMIN_ID, c1, m1)
             except Exception as e:
-                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nBot must be Admin in the channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nI cannot access the Start Message.\nMake sure I am Admin in that channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_INPUT
 
             await db.save_content(uid, 'batch', c1, m1, end_id=m2)
-            await update.message.reply_text(f"✅ <b>Batch Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
+            await update.message.reply_text(f"✅ <b>Batch Saved!</b> ({m2-m1+1} files)\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
             return ConversationHandler.END
 
         elif len(links) == 1:
@@ -213,14 +213,13 @@ async def cast_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         context.user_data['bc_photo'] = update.message.photo[-1].file_id if update.message and update.message.photo else None
     
-    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back_photo")]]
+    kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
     txt = "<b>Broadcast: Send Text</b> (or Skip)"
     if update.message: await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     else: await update.callback_query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     return BC_TEXT
 
 async def back_to_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This function allows going back to the photo step
     kb = [[InlineKeyboardButton("Skip", callback_data="skip"), InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text("<b>Broadcast: Send Photo</b> (or Skip)", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     return BC_PHOTO
@@ -260,7 +259,7 @@ async def run_broadcast(context):
 
 # --- FORCE JOIN ---
 async def menu_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton("🗑️ Delete All", callback_data="del_force")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
+    kb = [[InlineKeyboardButton("🗑️ Delete All Links", callback_data="del_force")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text("Send <b>Force Join Photo</b> (or /cancel).", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
     return F_MEDIA
 
@@ -386,7 +385,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     m = await context.bot.get_chat_member(cid, uid)
                     if m.status in ['left', 'kicked']: is_member = False
-                except: is_member = False 
+                except: is_member = False # Assume not joined if cant check
             else: is_member = False
 
     if not is_member and upd_link:
@@ -426,7 +425,9 @@ async def flow_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_force_join(update, context):
     uid = update.effective_user.id
+    
     channels = await db.get_force_channels()
+    # Force Join shows for EVERYONE (if set)
     if channels:
         f_txt = await db.get_setting('f_txt') or "Join these to access files:"
         f_ph = await db.get_setting('f_ph')
