@@ -45,6 +45,11 @@ class Database:
         if user_id == ADMIN_ID:
             await self.settings.update_one({'_id': 'admin_stat'}, {'$set': {'seen': datetime.now()}}, upsert=True)
 
+    async def is_admin_online(self):
+        doc = await self.settings.find_one({'_id': 'admin_stat'})
+        if not doc: return False
+        return (datetime.now() - doc['seen']).total_seconds() < 600
+
     async def get_all_users(self):
         cursor = self.users.find({})
         return [doc['_id'] async for doc in cursor]
@@ -124,9 +129,9 @@ async def m_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text(
         "<b>Send File / Link / Batch:</b>\n\n"
-        "1. <b>Forward File</b> (Recommended)\n"
+        "1. <b>Forward File</b> (Best for Restricted)\n"
         "2. <b>Single Link:</b> `https://t.me/c/xxx/100`\n"
-        "3. <b>Batch (Range):</b> `https://t.me/c/xxx/100 https://t.me/c/xxx/105`\n\n"
+        "3. <b>Batch:</b> `Link1 Link2`\n\n"
         "⚠️ <i>For links, I must be Admin in that channel!</i>",
         reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML
     )
@@ -137,16 +142,13 @@ async def h_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(uuid.uuid4())[:8]
     kb = [[InlineKeyboardButton("🔙 Back", callback_data="back")]]
 
-    # 1. Check for Links
+    # A. LINKS
     links = re.findall(r'(https?://t\.me/[^\s]+)', txt)
-    
     if links:
-        # A. BATCH (2 Links)
+        # Batch
         if len(links) >= 2:
-            start_link = links[0]
-            end_link = links[1]
-            c1, m1 = parse_link(start_link)
-            c2, m2 = parse_link(end_link)
+            c1, m1 = parse_link(links[0])
+            c2, m2 = parse_link(links[1])
             
             if not c1 or not c2 or c1 != c2:
                 await update.message.reply_text("❌ Error: Links must be from the same channel.", reply_markup=InlineKeyboardMarkup(kb))
@@ -156,47 +158,45 @@ async def h_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 await context.bot.copy_message(ADMIN_ID, c1, m1)
             except Exception as e:
-                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nI cannot access the Start Message.\nMake sure I am Admin in that channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nBot must be Admin in the channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_IN
 
             await db.save_content(uid, 'batch', c1, m1, end_id=m2)
             await update.message.reply_text(f"✅ <b>Batch Saved!</b> ({m2-m1+1} files)\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
             return ConversationHandler.END
 
-        # B. SINGLE LINK
+        # Single
         elif len(links) == 1:
             c_id, m_id = parse_link(links[0])
             if not c_id:
-                await update.message.reply_text("❌ Invalid Link Format.", reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text("❌ Invalid Link.", reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_IN
             
             try:
                 await context.bot.copy_message(ADMIN_ID, c_id, m_id)
             except Exception as e:
-                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nI cannot access that message.\nMake sure I am Admin in that channel.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
+                await update.message.reply_text(f"❌ <b>Access Denied!</b>\nBot must be Admin.\nError: {e}", parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
                 return CONTENT_IN
 
             await db.save_content(uid, 'single', c_id, m_id)
             await update.message.reply_text(f"✅ <b>Link Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
             return ConversationHandler.END
 
-    # C. FILE FORWARD
-    if msg.forward_from_chat or msg.chat_id:
+    # B. FILE FORWARD (Capture File ID)
+    if msg:
         file_id, file_type = None, None
         if msg.document: file_id, file_type = msg.document.file_id, 'doc'
         elif msg.video: file_id, file_type = msg.video.file_id, 'video'
         elif msg.photo: file_id, file_type = msg.photo[-1].file_id, 'photo'
         elif msg.audio: file_id, file_type = msg.audio.file_id, 'audio'
         
-        # Save using Current Chat ID (Admin DM) as source to ensure bot has access
-        # Also saving file_id as fallback for restricted channels
-        if file_id or msg.chat_id:
-            src = msg.chat_id 
+        if file_id:
+            src = msg.chat_id
             await db.save_content(uid, 'single', src, msg.message_id, caption=msg.caption, file_id=file_id, file_type=file_type)
             await update.message.reply_text(f"✅ <b>File Saved!</b>\n\nhttps://t.me/{context.bot.username}?start={uid}", reply_markup=InlineKeyboardMarkup(kb))
             return ConversationHandler.END
     
-    await update.message.reply_text("❌ Unknown format. Send Link(s) or File.", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("❌ Unknown content.", reply_markup=InlineKeyboardMarkup(kb))
     return CONTENT_IN
 
 # --- BROADCAST ---
@@ -246,7 +246,6 @@ async def run_broadcast(context):
     users = await db.get_all_users()
     photo = data.get('bc_photo')
     text = data.get('bc_text')
-    
     for uid in users:
         try:
             if photo: await context.bot.send_photo(uid, photo, caption=text)
@@ -254,7 +253,7 @@ async def run_broadcast(context):
             await asyncio.sleep(0.05)
         except: pass
 
-# --- FORCE JOIN SETTINGS ---
+# --- FORCE JOIN ---
 async def m_force(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("🗑️ Delete All Links", callback_data="del_force")], [InlineKeyboardButton("🔙 Back", callback_data="back")]]
     await update.callback_query.edit_message_text("Send <b>Force Join Photo</b> (or /cancel).", reply_markup=InlineKeyboardMarkup(build_menu(kb[0] + kb[1], 2)), parse_mode=ParseMode.HTML)
@@ -367,36 +366,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     await db.add_user(uid, update.effective_user.first_name, update.effective_user.username)
     
-    # Check if payload (Deep Link)
+    # Store deep link payload
     if context.args:
         context.user_data['pl'] = context.args[0]
-        # SKIP WELCOME -> GO TO UPDATE CHECK -> THEN FORCE JOIN
-        await check_upd(update, context, uid, skip_welcome=True)
-        return
 
-    # Normal Start - Check Update Channel
-    await check_upd(update, context, uid, skip_welcome=False)
-
-async def check_upd(update, context, uid, skip_welcome=False):
+    # --- CHECK UPDATE CHANNEL STATUS ---
     upd_link = await db.get_setting('upd_link')
     is_member = True
     
     if upd_link:
-        # Check session verification
         if not context.user_data.get('upd_verified'):
             cid = get_channel_id_from_link(upd_link)
             if cid:
                 try:
                     m = await context.bot.get_chat_member(cid, uid)
                     if m.status in ['left', 'kicked']: is_member = False
-                except: 
-                    # If bot fails to check (not admin), force button
-                    is_member = False
-            else:
-                is_member = False # Private link
+                except: is_member = False # Assume not joined if check fails
+            else: is_member = False
 
     if not is_member and upd_link:
-        # Show Update Channel Join prompt
         w_txt = await db.get_setting('w_txt') or "Welcome!"
         w_ph = await db.get_setting('w_ph')
         
@@ -405,52 +393,35 @@ async def check_upd(update, context, uid, skip_welcome=False):
         c_btns = [InlineKeyboardButton(b['name'], url=b['link']) for b in cust]
         footer = [InlineKeyboardButton("🆘 Support Chat", callback_data="supp")]
         
-        full_kb = build_menu(btns, 2) + build_menu(c_btns, 2) + [footer]
+        markup = InlineKeyboardMarkup(build_menu(btns, 2) + build_menu(c_btns, 2) + [footer])
         
-        if w_ph: msg = await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=InlineKeyboardMarkup(full_kb))
-        else: msg = await update.message.reply_text(w_txt, reply_markup=InlineKeyboardMarkup(full_kb))
+        if w_ph: msg = await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=markup)
+        else: msg = await update.message.reply_text(w_txt, reply_markup=markup)
         context.user_data['welcome_msg_id'] = msg.message_id
-        return
+        return ConversationHandler.END
 
-    # If member, proceed
-    if skip_welcome:
-        await check_force_join(update, context)
-    else:
-        # Show standard welcome if normal start
-        await show_welcome_screen(update, context)
-
-async def show_welcome_screen(update, context):
-    w_txt = await db.get_setting('w_txt') or "Welcome!"
-    w_ph = await db.get_setting('w_ph')
-    cust = await db.get_custom_btns()
-    c_btns = [InlineKeyboardButton(b['name'], url=b['link']) for b in cust]
-    footer = [InlineKeyboardButton("🆘 Support Chat", callback_data="supp")]
-    markup = InlineKeyboardMarkup(build_menu(c_btns, 2, footer))
-    
-    if w_ph: await update.message.reply_photo(w_ph, caption=w_txt, reply_markup=markup)
-    else: await update.message.reply_text(w_txt, reply_markup=markup)
+    await flow_step_2(update, context)
 
 async def chk_upd_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['upd_verified'] = True
-    uid = update.effective_user.id
     try: await update.callback_query.message.delete()
     except: pass
+    await flow_step_2(update, context)
+
+async def flow_step_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     
-    # Support Message
+    # 1. Support Msg (1 min)
     kb = [[InlineKeyboardButton("🆘 Contact Admin Now", callback_data="supp")]]
     msg = await context.bot.send_message(uid, "ℹ️ <b>Contact admin now for any query.</b>\n(Disappears in 1 min)", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
     context.job_queue.run_once(del_msg, 60, data={'c': uid, 'm': msg.message_id})
-
-    # Proceed to Force Join check
+    
+    # 2. Check Force Join
     await check_force_join(update, context)
 
 async def check_force_join(update, context):
     uid = update.effective_user.id
-    # Ensure pending content exists before showing force join
-    if not context.user_data.get('pl'): 
-        if update.callback_query: await show_welcome_screen(update.callback_query, context)
-        return
-
+    
     channels = await db.get_force_channels()
     if channels:
         f_txt = await db.get_setting('f_txt') or "Join these to access files:"
@@ -481,7 +452,7 @@ async def deliver(update, context, uid):
     try:
         msgs = []
         if data['type'] == 'single':
-            # Priority: Try File ID
+            # Priority: File ID
             if data.get('fid'):
                 ftype, cap = data.get('ftype', 'doc'), data.get('cap', "")
                 if ftype == 'video': m = await context.bot.send_video(uid, data['fid'], caption=cap)
@@ -572,12 +543,12 @@ def main():
     
     fallback = [CommandHandler("start", cmd_start), CommandHandler("admin", cmd_admin), CallbackQueryHandler(back_home, pattern="back")]
 
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_add, pattern="menu_add")], states={CONTENT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_content), MessageHandler(filters.ALL & ~filters.COMMAND, h_content)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_cast, pattern="menu_cast")], states={BC_PHOTO: [MessageHandler(filters.ALL & ~filters.COMMAND, h_bc_photo), CallbackQueryHandler(h_bc_photo, pattern="skip")], BC_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_bc_text)], BC_TIME: [CallbackQueryHandler(h_bc_send)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_wel, pattern="menu_wel")], states={WEL_MEDIA: [MessageHandler(filters.PHOTO, save_w_media)], WEL_TEXT: [MessageHandler(filters.TEXT, save_w_text)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_upd, pattern="menu_upd"), CallbackQueryHandler(del_upd, pattern="del_upd")], states={UPD_LINK: [MessageHandler(filters.TEXT, save_upd)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_force, pattern="menu_force"), CallbackQueryHandler(del_force, pattern="del_force")], states={F_MEDIA: [MessageHandler(filters.PHOTO, save_f_media)], F_TEXT: [MessageHandler(filters.TEXT, save_f_text)], F_LINKS: [MessageHandler(filters.TEXT, save_f_links)]}, fallbacks=fallback, allow_reentry=True))
-    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(menu_btn, pattern="menu_btn"), CallbackQueryHandler(del_btn, pattern="del_btn")], states={BTN_TXT: [MessageHandler(filters.TEXT, save_btn)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_add, pattern="m_add")], states={CONTENT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_content), MessageHandler(filters.ALL & ~filters.COMMAND, h_content)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_cast, pattern="m_cast")], states={BC_PHOTO: [MessageHandler(filters.ALL & ~filters.COMMAND, h_bc_photo), CallbackQueryHandler(h_bc_photo, pattern="skip")], BC_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, h_bc_text)], BC_TIME: [CallbackQueryHandler(h_bc_send)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_wel, pattern="m_wel")], states={WEL_MEDIA: [MessageHandler(filters.PHOTO, save_w_media)], WEL_TEXT: [MessageHandler(filters.TEXT, save_w_text)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_upd, pattern="m_upd"), CallbackQueryHandler(del_upd, pattern="del_upd")], states={UPD_LINK: [MessageHandler(filters.TEXT, save_upd)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_force, pattern="m_force"), CallbackQueryHandler(del_force, pattern="del_force")], states={F_MEDIA: [MessageHandler(filters.PHOTO, save_f_media)], F_TEXT: [MessageHandler(filters.TEXT, save_f_text)], F_LINKS: [MessageHandler(filters.TEXT, save_f_links)]}, fallbacks=fallback, allow_reentry=True))
+    app.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(m_btn, pattern="m_btn"), CallbackQueryHandler(del_btn, pattern="del_btn")], states={BTN_TXT: [MessageHandler(filters.TEXT, save_btn)]}, fallbacks=fallback, allow_reentry=True))
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
