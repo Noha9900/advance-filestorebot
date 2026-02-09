@@ -12,7 +12,8 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 ADMINS = [int(x) for x in os.getenv("ADMINS", "").split(",")]
-PORT = int(os.getenv("PORT", 8080))
+# Render automatically assigns a PORT env variable
+PORT = int(os.getenv("PORT", 8080)) 
 
 app = Client("ComplexBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 db = AsyncIOMotorClient(MONGO_URL).FileStoreBot
@@ -41,7 +42,7 @@ async def get_config():
             "support_active": True, 
             "welcome_enabled": False, 
             "fjoin_channels": [], 
-            "fjoin_text": "Join our channels to continue!",
+            "fjoin_text": "<b>Join our channels to continue!</b>",
             "welcome_sec": 10
         }
         await db.settings.insert_one(config)
@@ -76,7 +77,7 @@ async def handle_admin_callbacks(c, cb: CallbackQuery):
     elif data == "delete_msg":
         await cb.message.delete()
 
-# --- INPUT PROCESSOR (Logic for Admin Settings) ---
+# --- INPUT PROCESSOR ---
 @app.on_message(filters.user(ADMINS) & filters.private)
 async def admin_input_processor(c, m):
     uid = m.from_user.id
@@ -96,13 +97,7 @@ async def admin_input_processor(c, m):
         await m.reply("✅ Force Join Updated!", reply_markup=get_admin_main())
         del admin_states[uid]
 
-    elif state == "waiting_welcome_sec":
-        if m.text.isdigit():
-            await db.settings.update_one({"id": "config"}, {"$set": {"welcome_sec": int(m.text)}})
-            await m.reply(f"✅ Timer set to {m.text}s.", reply_markup=get_admin_main())
-            del admin_states[uid]
-
-# --- USER GATEWAY (The Start Handler) ---
+# --- USER GATEWAY ---
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(c, m):
     config = await get_config()
@@ -113,32 +108,27 @@ async def start_handler(c, m):
         w_text = config.get("welcome_text", "Welcome!").replace("{name}", m.from_user.first_name)
         w_photo = config.get("welcome_photo")
         
-        if w_photo: msg = await m.reply_photo(w_photo, caption=w_text)
-        else: msg = await m.reply_text(w_text)
+        msg = await (m.reply_photo(w_photo, caption=w_text) if w_photo else m.reply_text(w_text))
         
-        # Immediate timer for disappearance
         async def auto_del(message, delay):
             await asyncio.sleep(delay)
             try: await message.delete()
             except: pass
-        
         asyncio.create_task(auto_del(msg, config.get("welcome_sec", 10)))
 
     # 2. Force Join Check
     if not await is_subscribed(c, user_id):
-        # Once welcome disappears, user sees this
         await asyncio.sleep(config.get("welcome_sec", 10))
         buttons = []
         for cid in config.get("fjoin_channels", []):
             try:
                 chat = await c.get_chat(cid)
-                buttons.append([InlineKeyboardButton(f"Join {chat.title}", url=chat.invite_link or "https://t.me")])
+                buttons.append([InlineKeyboardButton(f"Join {chat.title}", url=chat.invite_link or f"https://t.me/{chat.username}")])
             except: continue
-        
         return await m.reply_text(config.get("fjoin_text"), reply_markup=InlineKeyboardMarkup(buttons))
 
     # 3. Handle Batch File Links
-    if "batch_" in m.text:
+    if len(m.text.split()) > 1 and "batch_" in m.text:
         b_id = m.text.split("_")[1]
         data = await db.batches.find_one({"batch_id": b_id})
         if data:
@@ -147,17 +137,30 @@ async def start_handler(c, m):
                 s = await c.send_cached_media(m.chat.id, f)
                 sent.append(s.id)
             
-            # 30-minute auto delete
             scheduler.add_job(lambda: c.delete_messages(m.chat.id, sent), "date", 
                               run_date=datetime.now() + timedelta(minutes=30))
             await m.reply("⏳ Files will be deleted in 30 minutes for security.")
 
-# --- SERVER ---
+# --- WEB SERVER FOR RENDER ---
+async def web_handle(request):
+    return web.Response(text="Bot is running!")
+
+async def start_web_server():
+    webapp = web.Application()
+    webapp.router.add_get("/", web_handle)
+    runner = web.AppRunner(webapp)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+# --- MAIN RUNNER ---
 async def main():
     if not scheduler.running: scheduler.start()
+    await start_web_server()
     await app.start()
-    # Web server logic for Render...
+    print(f"Bot started on port {PORT}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.get_event_loop().run_until_complete(main())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
