@@ -2,11 +2,12 @@ import os, asyncio, secrets, logging
 from datetime import datetime
 from flask import Flask
 from threading import Thread
-import certifi
+import certifi # SSL Certificate verification
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
-    MessageHandler, filters, ContextTypes, ConversationHandler
+    MessageHandler, filters, ContextTypes, ConversationHandler, Defaults
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -21,27 +22,34 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MONGO_URL = os.getenv("MONGO_URL")
 PORT = int(os.getenv("PORT", "8080"))
 
-# Production DB Connection
+# Production DB Connection (Optimized for Cloud)
 client = AsyncIOMotorClient(
     MONGO_URL, 
     maxPoolSize=10, 
     minPoolSize=1, 
     serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=10000,
     tlsCAFile=certifi.where()
 )
 db = client["vault_bot_db"]
 col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"]
 
+# Conversation States
 (W_TXT, W_PHO, AD_PHO_STATE, AD_TXT_STATE, AD_LNK_STATE, ANI_NA, ANI_ME, ANI_DE, ANI_LI, 
  MOV_NA, MOV_ME, MOV_DE, MOV_LI, A_V_FOLD, A_V_SUB, A_V_POST, A_V_DESC, 
  A_V_FILES, V_KEY_INPUT, U_GUIDE_SELECT, U_V_SUB_SELECT, ADM_DEL_SELECT) = range(22)
 
-# --- SAFETY HELPER ---
+# --- SAFETY HELPER (Added Animation Support) ---
+def get_file_info(message):
+    if message.photo: return message.photo[-1].file_id, "photo"
+    if message.video: return message.video.file_id, "video"
+    if message.animation: return message.animation.file_id, "animation"
+    if message.document: return message.document.file_id, "document"
+    return None, None
+
 def get_fid(message):
-    if message.photo: return message.photo[-1].file_id
-    if message.video: return message.video.file_id
-    if message.document: return message.document.file_id
-    return None
+    fid, _ = get_file_info(message)
+    return fid
 
 # --- UTILS ---
 async def del_msg(context: ContextTypes.DEFAULT_TYPE):
@@ -49,14 +57,13 @@ async def del_msg(context: ContextTypes.DEFAULT_TYPE):
     except: pass
 
 async def get_settings():
-    w = await col_settings.find_one({"type": "welcome"}) or {"text": "Welcome!", "photo": None}
-    a = await col_settings.find_one({"type": "adult"}) or {"text": "Adult Zone", "photo": None, "channels": []}
+    w = await col_settings.find_one({"type": "welcome"}) or {"text": "Welcome! Bot is ready.", "photo": None}
+    a = await col_settings.find_one({"type": "adult"}) or {"text": "Adult Zone Restricted", "photo": None, "channels": []}
     return w, a
 
 # --- USER SIDE ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # CRITICAL FIX: Clear state so buttons always work fresh
-    context.user_data.clear()
+    context.user_data.clear() # Reset state
     w, _ = await get_settings()
     kb = [[InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad")],
           [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
@@ -64,111 +71,88 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     markup = InlineKeyboardMarkup(kb)
     
     if update.message:
-        # If user types /start
         if w.get("photo"):
             msg = await update.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
         else:
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
-        # Auto-delete welcome message after 1 min to keep chat clean (optional)
+        # Auto-delete welcome message after 1 min
         context.job_queue.run_once(del_msg, 60, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
-        # If user clicks "Back"
-        try: 
-            await update.callback_query.message.delete() # Delete old menu to refresh
-            if w.get("photo"):
-                await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
-            else:
-                await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
-        except: 
-            pass
+        # Handle "Back" navigation cleanly
+        try: await update.callback_query.message.delete()
+        except: pass
+        if w.get("photo"):
+            await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
+        else:
+            await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Reset. Type /start.")
+    await update.message.reply_text("❌ Operation Cancelled. Type /start.")
     return ConversationHandler.END
 
 async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    # Back Button Logic
-    if query.data == "main": 
-        return await start(update, context)
+    if query.data == "main": return await start(update, context)
 
-    # Adult Stream
+    # --- ADULT STREAM ---
     if query.data == "u_ad":
         _, ad = await get_settings()
         kb = [[InlineKeyboardButton(c["name"], url=c["link"])] for c in ad.get("channels", [])]
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         
-        # Determine if we edit or send new media
-        if ad.get("photo"): 
+        if ad.get("photo"):
             await query.message.delete()
             await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
-        else: 
-            # If switching from photo to text, delete and send
-            if query.message.photo:
+        else:
+            if query.message.photo: # If switching media types, delete and resend
                 await query.message.delete()
                 await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
             else:
                 await query.edit_message_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
-        
-        # CRITICAL FIX: Return END so the bot stays in the main menu state listening for other buttons
         return ConversationHandler.END
 
-    # Anime / Movie Lists
+    # --- LISTS (ANIME/MOVIE) ---
     elif "u_list_" in query.data:
         g_type = query.data.split("_")[-1]
-        # FIX: Added sort to ensure list order doesn't change
         items = await col_guides.find({"type": g_type}).sort("_id", 1).to_list(100)
         
-        txt = f"📖 **{g_type.upper()} LIST**\n\n"
-        if not items:
-            txt += "List is empty."
-        else:
-            txt += "Reply with the **Number** to get content:\n\n"
-            for i, x in enumerate(items):
-                txt += f"{i+1}. {x['name']}\n"
+        txt = f"📖 <b>{g_type.upper()} LIST</b>\n\n"
+        if not items: txt += "No content added yet."
+        else: txt += "Reply with the <b>Number</b> to watch:\n\n"
+        for i, x in enumerate(items): txt += f"{i+1}. {x['name']}\n"
         
         context.user_data["view_type"] = g_type
         
-        # Handling media vs text message transitions
-        if query.message.photo:
-            await query.message.delete()
-            await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main")]]))
-        else:
-            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main")]]))
-        
+        await query.message.delete()
+        await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main")]]))
         return U_GUIDE_SELECT
 
-    # Secret Vault Folders
+    # --- VAULT FOLDERS ---
     elif query.data == "u_vault_folders":
         folders = await col_vaults.distinct("folder")
         btns = [InlineKeyboardButton(f, callback_data=f"vfold_{f}") for f in folders]
         kb = [btns[i:i + 2] for i in range(0, len(btns), 2)]
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         
-        if query.message.photo:
-            await query.message.delete()
-            await query.message.reply_text("📂 Select a Folder:", reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            await query.edit_message_text("📂 Select a Folder:", reply_markup=InlineKeyboardMarkup(kb))
-        
-        return ConversationHandler.END # Stay in menu state until specific folder clicked
+        await query.message.delete()
+        await query.message.reply_text("📂 Select a Folder:", reply_markup=InlineKeyboardMarkup(kb))
+        return ConversationHandler.END
 
-    # Specific Vault Folder Content
+    # --- VAULT CONTENTS ---
     elif query.data.startswith("vfold_"):
         fname = query.data.replace("vfold_", "")
-        # FIX: Added sort
         items = await col_vaults.find({"folder": fname}).sort("_id", 1).to_list(100)
         
-        txt = f"📁 **{fname}**\n\nReply with **Number** to unlock:\n"
-        for i, x in enumerate(items):
-            txt += f"{i+1}. {x['sub_name']}\n"
+        txt = f"📁 <b>{fname}</b>\n\nReply with <b>Number</b> to unlock:\n"
+        for i, x in enumerate(items): txt += f"{i+1}. {x['sub_name']}\n"
             
         context.user_data["active_vault_folder"] = fname
-        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="u_vault_folders")]]))
+        await query.message.delete()
+        await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="u_vault_folders")]]))
         return U_V_SUB_SELECT
 
 # --- ADMIN PANEL ---
@@ -178,7 +162,7 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
           [InlineKeyboardButton("Add Anime", callback_data="a_ani"), InlineKeyboardButton("Add Movie", callback_data="a_mov")],
           [InlineKeyboardButton("Create Vault Content 🔒", callback_data="a_v")],
           [InlineKeyboardButton("🗑 Delete Mode", callback_data="a_del")]]
-    await update.message.reply_text("🛠 **ADMIN PANEL**", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("🛠 <b>ADMIN PANEL</b>", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
 async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,12 +188,14 @@ async def save_w_pho(update, context):
 
 async def save_g_name(update, context):
     context.user_data["gtmp"] = {"name": update.message.text, "type": context.user_data["p"]}
-    await update.message.reply_text("Send Media (Photo/Video):"); return ANI_ME if context.user_data["p"]=="anime" else MOV_ME
+    await update.message.reply_text("Send Media (Photo/Video/GIF):"); return ANI_ME if context.user_data["p"]=="anime" else MOV_ME
 
 async def save_g_media(update, context):
-    fid = get_fid(update.message)
-    if not fid: await update.message.reply_text("❌ Send Media:"); return
+    fid, ftype = get_file_info(update.message)
+    if not fid: await update.message.reply_text("❌ Send valid Media:"); return
+    
     context.user_data["gtmp"]["file"] = fid
+    context.user_data["gtmp"]["media_type"] = ftype 
     await update.message.reply_text("Send Description:"); return ANI_DE if context.user_data["p"]=="anime" else MOV_DE
 
 async def save_g_desc(update, context):
@@ -221,32 +207,38 @@ async def save_g_final(update, context):
     await col_guides.insert_one(context.user_data["gtmp"])
     await update.message.reply_text("✅ Added!"); return ConversationHandler.END
 
+# --- VAULT SAVING ---
 async def v_sub(update, context):
     context.user_data["v_data"] = {"folder": update.message.text, "files": []}
-    await update.message.reply_text("📝 Sub-Name:"); return A_V_SUB
+    await update.message.reply_text("📝 Sub-Name (e.g. Episode 1):"); return A_V_SUB
 
 async def v_post(update, context):
     context.user_data["v_data"]["sub_name"] = update.message.text
-    await update.message.reply_text("🖼 Send Poster:"); return A_V_POST
+    await update.message.reply_text("🖼 Send Poster Image:"); return A_V_POST
 
 async def v_desc(update, context):
     fid = get_fid(update.message)
-    if not fid: await update.message.reply_text("❌ Send Media:"); return
+    if not fid: await update.message.reply_text("❌ Poster required (Photo):"); return
     context.user_data["v_data"]["poster"] = fid
     await update.message.reply_text("✍️ Description:"); return A_V_DESC
 
 async def v_files_start(update, context):
     context.user_data["v_data"]["desc"] = update.message.text
-    await update.message.reply_text("📎 Send Files. Send /done when finished:"); return A_V_FILES
+    await update.message.reply_text("📎 Send Files. Type /done when finished:"); return A_V_FILES
 
 async def v_collect(update, context):
     if update.message.text and update.message.text.lower() == "/done":
+        if "v_data" not in context.user_data:
+            await update.message.reply_text("❌ Session expired. Start over."); return ConversationHandler.END
+            
         key = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*") for _ in range(12))
         context.user_data["v_data"]["key"] = key
         await col_vaults.insert_one(context.user_data["v_data"])
-        await update.message.reply_text(f"✅ Saved! Key: `{key}`"); return ConversationHandler.END
+        await update.message.reply_text(f"✅ Saved!\nFolder: {context.user_data['v_data']['folder']}\nKey: <code>{key}</code>"); return ConversationHandler.END
+    
     fid = get_fid(update.message)
     if fid: context.user_data["v_data"]["files"].append(fid)
+    else: await update.message.reply_text("❌ Not a file. Send file or /done")
     return A_V_FILES
 
 async def ad_pho_fn(update, context):
@@ -265,62 +257,64 @@ async def ad_lnk_fn(update, context):
         await update.message.reply_text("✅ Added! Send next (Name | Link) or /start to finish."); return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
-# --- CONTENT ACCESS (FIXED) ---
+# --- CONTENT DELIVERY ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
-        # FIX: Added Sort to ensure number matches DB
-        items = await col_vaults.find({"folder": context.user_data["active_vault_folder"]}).sort("_id", 1).to_list(100)
+        items = await col_vaults.find({"folder": context.user_data.get("active_vault_folder")}).sort("_id", 1).to_list(100)
         
         if 0 <= idx < len(items):
             item = items[idx]
             context.user_data["target_v"] = item["_id"]
             if item.get("poster"):
-                await update.message.reply_photo(item["poster"], caption=f"📁 **{item['sub_name']}**\n\n{item['desc']}\n\n🔐 **Enter Key:**")
+                await update.message.reply_photo(item["poster"], caption=f"📁 <b>{item['sub_name']}</b>\n\n{item['desc']}\n\n🔐 <b>Enter Key:</b>")
             else:
-                await update.message.reply_text(f"📁 **{item['sub_name']}**\n\n{item['desc']}\n\n🔐 **Enter Key:**")
+                await update.message.reply_text(f"📁 <b>{item['sub_name']}</b>\n\n{item['desc']}\n\n🔐 <b>Enter Key:</b>")
             return V_KEY_INPUT
-        else: 
-            await update.message.reply_text(f"❌ Invalid Number. Choose 1-{len(items)}")
-    except ValueError: 
-        await update.message.reply_text("❌ Send a Number.")
+        else: await update.message.reply_text(f"❌ Invalid Number. 1-{len(items)}")
+    except ValueError: await update.message.reply_text("❌ Send a Number.")
     return U_V_SUB_SELECT
 
 async def vault_key_check(update, context):
-    v = await col_vaults.find_one({"_id": ObjectId(context.user_data["target_v"])})
+    v = await col_vaults.find_one({"_id": ObjectId(context.user_data.get("target_v"))})
     if v and update.message.text.strip() == v["key"]:
-        await update.message.reply_text("🔓 Unlocked! Files delete in 30 mins.")
+        await update.message.reply_text("🔓 Unlocked! Files auto-delete in 30m.")
         for f in v["files"]:
-            msg = await update.message.reply_document(f) if "document" in str(f) else await update.message.reply_video(f)
+            try: msg = await update.message.reply_video(f)
+            except: msg = await update.message.reply_document(f)
             context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
-    else: 
-        await update.message.reply_text("❌ Wrong Key")
+    else: await update.message.reply_text("❌ Wrong Key")
     return ConversationHandler.END
 
 async def guide_show(update, context):
     try:
         idx = int(update.message.text) - 1
-        # FIX: Added Sort
-        items = await col_guides.find({"type": context.user_data["view_type"]}).sort("_id", 1).to_list(100)
+        items = await col_guides.find({"type": context.user_data.get("view_type")}).sort("_id", 1).to_list(100)
         
         if 0 <= idx < len(items):
             item = items[idx]
-            caption = f"⭐ **{item['name']}**\n\n{item['desc']}\n\n🔗 Watch: {item['link']}"
-            if item.get("file"):
-                await update.message.reply_photo(item["file"], caption=caption)
+            caption = f"⭐ <b>{item['name']}</b>\n\n{item['desc']}\n\n🔗 Watch: {item['link']}"
+            mtype = item.get("media_type", "photo") 
+            
+            if mtype == "video":
+                await update.message.reply_video(item["file"], caption=caption)
+            elif mtype == "animation":
+                await update.message.reply_animation(item["file"], caption=caption)
+            elif mtype == "document":
+                await update.message.reply_document(item["file"], caption=caption)
             else:
-                await update.message.reply_text(caption)
+                await update.message.reply_photo(item["file"], caption=caption)
         else: 
-            await update.message.reply_text(f"❌ Invalid Number. Choose 1-{len(items)}")
+            await update.message.reply_text(f"❌ Invalid Number. 1-{len(items)}")
     except ValueError: 
         await update.message.reply_text("❌ Send a Number.")
     return U_GUIDE_SELECT
 
-# --- DELETE ---
+# --- DELETE & MISC ---
 async def admin_del_menu(update, context):
     kb = [[InlineKeyboardButton("Anime", callback_data="del_anime"), InlineKeyboardButton("Movie", callback_data="del_movies")],
           [InlineKeyboardButton("Vault", callback_data="del_vault"), InlineKeyboardButton("Adult Link", callback_data="del_adult")],
-          [InlineKeyboardButton("🔙 Back to Admin", callback_data="a_panel_back")]]
+          [InlineKeyboardButton("🔙 Back", callback_data="a_back")]]
     await update.callback_query.edit_message_text("🗑 Select Category:", reply_markup=InlineKeyboardMarkup(kb)); return ADM_DEL_SELECT
 
 async def admin_del_process(update, context):
@@ -354,12 +348,13 @@ def h(): return "OK"
 async def error_handler(update, context): logger.error(f"Error {context.error}")
 
 def main():
-    app = Application.builder().token(TOKEN).build()
+    # Set defaults to HTML to safely handle bold text and links
+    defaults = Defaults(parse_mode=ParseMode.HTML)
+    app = Application.builder().token(TOKEN).defaults(defaults).build()
     
     async def init(): await col_vaults.create_index("key", unique=True)
     asyncio.get_event_loop().run_until_complete(init())
 
-    # --- HANDLERS: START & MENU must be entry points AND fallbacks ---
     user_handlers = [
         CallbackQueryHandler(admin_router, pattern="^a_"), 
         CallbackQueryHandler(user_router, pattern="^u_"), 
@@ -373,8 +368,12 @@ def main():
         states={
             W_TXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_w_txt)], 
             W_PHO: [MessageHandler((filters.PHOTO | filters.Regex("/skip")) & ~filters.COMMAND, save_w_pho)],
-            ANI_NA: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_name)], ANI_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], ANI_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], ANI_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
-            MOV_NA: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_name)], MOV_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], MOV_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], MOV_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
+            ANI_NA: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_name)], 
+            ANI_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], 
+            ANI_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], ANI_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
+            MOV_NA: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_name)], 
+            MOV_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], 
+            MOV_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], MOV_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
             A_V_FOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_sub)], A_V_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_post)], A_V_POST: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, v_desc)], A_V_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_files_start)], A_V_FILES: [MessageHandler(filters.ALL & ~filters.COMMAND, v_collect)],
             AD_PHO_STATE: [MessageHandler((filters.PHOTO | filters.Regex("/skip")) & ~filters.COMMAND, ad_pho_fn)], AD_TXT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_txt_fn)], AD_LNK_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_lnk_fn)],
             U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), guide_show)], 
