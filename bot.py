@@ -45,14 +45,15 @@ async def get_settings():
     a = await col_settings.find_one({"type": "adult"}) or {"text": "Adult Zone", "photo": None, "channels": []}
     return w, a
 
-# --- USER SIDE: FIXED ROUTING ---
+# --- USER SIDE ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Clear user state to ensure fresh start
+    context.user_data.clear()
     w, _ = await get_settings()
     kb = [[InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad")],
           [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
           [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_vault_folders")]]
     markup = InlineKeyboardMarkup(kb)
-    
     if update.message:
         msg = await (update.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup) if w.get("photo") else update.message.reply_text(w["text"], reply_markup=markup))
         context.job_queue.run_once(del_msg, 30, data=msg.message_id, chat_id=update.effective_chat.id)
@@ -65,7 +66,7 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == "main": 
+    if query.data == "main":
         return await start(update, context)
 
     if query.data == "u_ad":
@@ -86,18 +87,17 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif query.data == "u_vault_folders":
         folders = await col_vaults.distinct("folder")
-        # Admin Folders in rows of 2
-        kb = [InlineKeyboardButton(folders[i], callback_data=f"vfold_{folders[i]}") for i in range(len(folders))]
-        rows = [kb[i:i + 2] for i in range(0, len(kb), 2)]
-        rows.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
-        await query.edit_message_text("📂 Folders:", reply_markup=InlineKeyboardMarkup(rows))
+        btns = [InlineKeyboardButton(f, callback_data=f"vfold_{f}") for f in folders]
+        # Two buttons per row logic
+        kb = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
+        await query.edit_message_text("📂 Folders:", reply_markup=InlineKeyboardMarkup(kb))
         return ConversationHandler.END
 
     elif query.data.startswith("vfold_"):
-        fname = query.data.split("_")[1]
+        fname = query.data.split("_", 1)[1]
         items = await col_vaults.find({"folder": fname}).to_list(100)
-        # Sub-names in a numbered list
-        txt = f"📁 **{fname}**\nReply with the Number to view details:\n\n" + "\n".join([f"{i+1}. {x['sub_name']}" for i, x in enumerate(items)])
+        txt = f"📁 **{fname}**\nReply with Number:\n\n" + "\n".join([f"{i+1}. {x['sub_name']}" for i, x in enumerate(items)])
         context.user_data["active_vault_folder"] = fname
         await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="u_vault_folders")]]))
         return U_V_SUB_SELECT
@@ -122,7 +122,7 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "a_del": return await admin_del_menu(update, context)
     if query.data == "a_panel_back": return await admin_panel(update, context)
 
-# --- REFINED SAVING LOGICS ---
+# --- REFINED SAVING LOGIC ---
 async def save_w_txt(update, context):
     context.user_data["wt"] = update.message.text
     await update.message.reply_text("Send Photo (or /skip):"); return W_PHO
@@ -138,7 +138,7 @@ async def save_g_name(update, context):
 
 async def save_g_media(update, context):
     fid = get_fid(update.message)
-    if not fid: await update.message.reply_text("❌ Send Media:"); return
+    if not fid: await update.message.reply_text("❌ Media Required:"); return
     context.user_data["gtmp"]["file"] = fid
     await update.message.reply_text("Send Description:"); return ANI_DE if context.user_data["p"]=="anime" else MOV_DE
 
@@ -161,7 +161,7 @@ async def v_post(update, context):
 
 async def v_desc(update, context):
     fid = get_fid(update.message)
-    if not fid: await update.message.reply_text("❌ Send Media:"); return
+    if not fid: await update.message.reply_text("❌ Poster Required:"); return
     context.user_data["v_data"]["poster"] = fid
     await update.message.reply_text("✍️ Description:"); return A_V_DESC
 
@@ -174,7 +174,7 @@ async def v_collect(update, context):
         key = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*") for _ in range(12))
         context.user_data["v_data"]["key"] = key
         await col_vaults.insert_one(context.user_data["v_data"])
-        await update.message.reply_text(f"✅ Vault Saved! Key: `{key}`"); return ConversationHandler.END
+        await update.message.reply_text(f"✅ Saved! Key: `{key}`"); return ConversationHandler.END
     fid = get_fid(update.message)
     if fid: context.user_data["v_data"]["files"].append(fid)
     return A_V_FILES
@@ -201,15 +201,16 @@ async def vault_select_sub(update, context):
         idx = int(update.message.text) - 1
         items = await col_vaults.find({"folder": context.user_data["active_vault_folder"]}).to_list(100)
         if 0 <= idx < len(items):
-            context.user_data["target_v"] = items[idx]["_id"]
-            await update.message.reply_photo(items[idx]["poster"], caption=f"📁 **{items[idx]['sub_name']}**\n\n{items[idx]['desc']}\n\n🔐 **Enter special key to unlock files:**")
+            item = items[idx]
+            context.user_data["target_v"] = item["_id"]
+            await update.message.reply_photo(item["poster"], caption=f"📁 **{item['sub_name']}**\n\n{item['desc']}\n\n🔐 **Enter Special Key to unlock files:**")
             return V_KEY_INPUT
     except: await update.message.reply_text("Invalid Number")
 
 async def vault_key_check(update, context):
     v = await col_vaults.find_one({"_id": ObjectId(context.user_data["target_v"])})
     if v and update.message.text == v["key"]:
-        await update.message.reply_text("🔓 Key Accepted! Sending files (auto-delete in 30 mins):")
+        await update.message.reply_text("🔓 Key Accepted! Files will delete in 30 mins.")
         for f in v["files"]:
             msg = await update.message.reply_document(f) if "document" in str(f) else await update.message.reply_video(f)
             context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
@@ -222,7 +223,7 @@ async def guide_show(update, context):
         items = await col_guides.find({"type": context.user_data["view_type"]}).to_list(100)
         if 0 <= idx < len(items):
             item = items[idx]
-            await update.message.reply_photo(item["file"], caption=f"⭐ **{item['name']}**\n\n{item['desc']}\n\n🔗 Watch Link: {item['link']}")
+            await update.message.reply_photo(item["file"], caption=f"⭐ **{item['name']}**\n\n{item['desc']}\n\n🔗 watch: {item['link']}")
     except: await update.message.reply_text("Invalid Number")
     return U_GUIDE_SELECT
 
@@ -230,8 +231,8 @@ async def guide_show(update, context):
 async def admin_del_menu(update, context):
     kb = [[InlineKeyboardButton("Anime", callback_data="del_anime"), InlineKeyboardButton("Movie", callback_data="del_movies")],
           [InlineKeyboardButton("Vault", callback_data="del_vault"), InlineKeyboardButton("Adult Link", callback_data="del_adult")],
-          [InlineKeyboardButton("🔙 Back to Admin", callback_data="a_panel_back")]]
-    await update.callback_query.edit_message_text("🗑 Select Category to Delete:", reply_markup=InlineKeyboardMarkup(kb)); return ADM_DEL_SELECT
+          [InlineKeyboardButton("🔙 Back", callback_data="a_panel_back")]]
+    await update.callback_query.edit_message_text("🗑 Delete from:", reply_markup=InlineKeyboardMarkup(kb)); return ADM_DEL_SELECT
 
 async def admin_del_process(update, context):
     dtype = update.callback_query.data.split("_")[1]
@@ -241,10 +242,9 @@ async def admin_del_process(update, context):
         kb = [[InlineKeyboardButton(c["name"], callback_data=f"confirm_del_{i}")] for i, c in enumerate(ad.get("channels", []))]
     else:
         col = col_guides if dtype in ["anime", "movies"] else col_vaults
-        items = await col.find({"type": dtype} if dtype in ["anime", "movies"] else {}).to_list(100)
+        items = await col.find({"type": dtype} if dtype != "vault" else {}).to_list(100)
         kb = [[InlineKeyboardButton(x.get("name") or x.get("sub_name"), callback_data=f"confirm_del_{x['_id']}")] for x in items]
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="a_del")])
-    await update.callback_query.edit_message_text("Select to delete permanently:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.callback_query.edit_message_text("Select to delete:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def admin_confirm_delete(update, context):
     oid = update.callback_query.data.split("_")[-1]
@@ -261,23 +261,21 @@ server = Flask(__name__)
 @server.route('/')
 def h(): return "OK"
 
-async def error_handler(update, context): logger.error(f"Error: {context.error}")
-
 def main():
     app = Application.builder().token(TOKEN).build()
     
-    async def init_db_task(): await col_vaults.create_index("key", unique=True)
-    asyncio.get_event_loop().run_until_complete(init_db_task())
+    async def init(): await col_vaults.create_index("key", unique=True)
+    asyncio.get_event_loop().run_until_complete(init())
 
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("admin", admin_panel),
+            # VITAL FIX: Move button patterns into entry points for direct access
             CallbackQueryHandler(admin_router, pattern="^a_"), 
             CallbackQueryHandler(user_router, pattern="^u_"), 
             CallbackQueryHandler(user_router, pattern="^vfold_"),
-            CallbackQueryHandler(user_router, pattern="^main$"),
-            CallbackQueryHandler(admin_panel, pattern="^a_panel_back$")
+            CallbackQueryHandler(start, pattern="^main$"),
         ],
         states={
             W_TXT: [MessageHandler(filters.TEXT, save_w_txt)], W_PHO: [MessageHandler(filters.PHOTO | filters.Regex("/skip"), save_w_pho)],
@@ -286,11 +284,12 @@ def main():
             A_V_FOLD: [MessageHandler(filters.TEXT, v_sub)], A_V_SUB: [MessageHandler(filters.TEXT, v_post)], A_V_POST: [MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, v_desc)], A_V_DESC: [MessageHandler(filters.TEXT, v_files_start)], A_V_FILES: [MessageHandler(filters.ALL, v_collect)],
             AD_PHO: [MessageHandler(filters.PHOTO | filters.Regex("/skip"), ad_pho)], AD_TXT: [MessageHandler(filters.TEXT, ad_txt)], AD_LNK: [MessageHandler(filters.TEXT, ad_lnk)],
             U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), guide_show)], U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), vault_select_sub)],
-            V_KEY_INPUT: [MessageHandler(filters.TEXT, vault_key_check)], ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
+            V_KEY_INPUT: [MessageHandler(filters.TEXT, vault_key_check)], 
+            ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
         fallbacks=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="main")], allow_reentry=True
     )
-    app.add_handler(conv); app.add_handler(CommandHandler("start", start)); app.add_error_handler(error_handler)
+    app.add_handler(conv); app.add_handler(CommandHandler("start", start))
     Thread(target=lambda: server.run(host='0.0.0.0', port=PORT)).start()
     app.run_polling(drop_pending_updates=True)
 
