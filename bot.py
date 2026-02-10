@@ -7,7 +7,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
-    MessageHandler, filters, ContextTypes, ConversationHandler, Defaults, PicklePersistence
+    MessageHandler, filters, ContextTypes, ConversationHandler, Defaults
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -39,9 +39,10 @@ col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"
 
 # --- SAFETY HELPER ---
 def get_file_info(message):
-    if message.photo: return message.photo[-1].file_id, "photo"
-    if message.video: return message.video.file_id, "video"
+    # Order matters: Animation > Video > Photo > Document
     if message.animation: return message.animation.file_id, "animation"
+    if message.video: return message.video.file_id, "video"
+    if message.photo: return message.photo[-1].file_id, "photo"
     if message.document: return message.document.file_id, "document"
     return None, None
 
@@ -122,7 +123,6 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, x in enumerate(items): txt += f"{i+1}. {x['name']}\n"
         
         context.user_data["view_type"] = g_type
-        
         await query.message.delete()
         await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main")]]))
         return U_GUIDE_SELECT
@@ -203,7 +203,7 @@ async def save_g_final(update, context):
     await col_guides.insert_one(context.user_data["gtmp"])
     await update.message.reply_text("✅ Added!"); return ConversationHandler.END
 
-# --- VAULT SAVING ---
+# --- VAULT SAVING (FIXED /done) ---
 async def v_sub(update, context):
     context.user_data["v_data"] = {"folder": update.message.text, "files": []}
     await update.message.reply_text("📝 Sub-Name (e.g. Episode 1):"); return A_V_SUB
@@ -223,7 +223,9 @@ async def v_files_start(update, context):
     await update.message.reply_text("📎 Send Files. Type /done when finished:"); return A_V_FILES
 
 async def v_collect(update, context):
-    if update.message.text and update.message.text.lower() == "/done":
+    # Logic to handle both Command and Text input for '/done'
+    msg_text = update.message.text or ""
+    if msg_text.lower() == "/done":
         if "v_data" not in context.user_data:
             await update.message.reply_text("❌ Session expired. Start over."); return ConversationHandler.END
             
@@ -232,9 +234,13 @@ async def v_collect(update, context):
         await col_vaults.insert_one(context.user_data["v_data"])
         await update.message.reply_text(f"✅ Saved!\nFolder: {context.user_data['v_data']['folder']}\nKey: <code>{key}</code>"); return ConversationHandler.END
     
+    # File capture logic
     fid = get_fid(update.message)
-    if fid: context.user_data["v_data"]["files"].append(fid)
-    else: await update.message.reply_text("❌ Not a file. Send file or /done")
+    if fid: 
+        context.user_data["v_data"]["files"].append(fid)
+        await update.message.reply_text(f"✅ File {len(context.user_data['v_data']['files'])} added. Send more or /done")
+    else: 
+        await update.message.reply_text("❌ Not a file. Send file or /done")
     return A_V_FILES
 
 async def ad_pho_fn(update, context):
@@ -253,7 +259,7 @@ async def ad_lnk_fn(update, context):
         await update.message.reply_text("✅ Added! Send next (Name | Link) or /start to finish."); return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
-# --- CONTENT DELIVERY ---
+# --- CONTENT DELIVERY (FIXED) ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
@@ -292,14 +298,19 @@ async def guide_show(update, context):
             caption = f"⭐ <b>{item['name']}</b>\n\n{item['desc']}\n\n🔗 Watch: {item['link']}"
             mtype = item.get("media_type", "photo") 
             
-            if mtype == "video":
-                await update.message.reply_video(item["file"], caption=caption)
-            elif mtype == "animation":
-                await update.message.reply_animation(item["file"], caption=caption)
-            elif mtype == "document":
+            # Safe Sending Logic (Fallback to Document if type mismatch)
+            try:
+                if mtype == "video":
+                    await update.message.reply_video(item["file"], caption=caption)
+                elif mtype == "animation":
+                    await update.message.reply_animation(item["file"], caption=caption)
+                elif mtype == "document":
+                    await update.message.reply_document(item["file"], caption=caption)
+                else:
+                    await update.message.reply_photo(item["file"], caption=caption)
+            except Exception as e:
+                # Fallback if Telegram rejects the file type (e.g. Video sent as Photo)
                 await update.message.reply_document(item["file"], caption=caption)
-            else:
-                await update.message.reply_photo(item["file"], caption=caption)
         else: 
             await update.message.reply_text(f"❌ Invalid Number. 1-{len(items)}")
     except ValueError: 
@@ -344,13 +355,7 @@ def h(): return "OK"
 async def error_handler(update, context): logger.error(f"Error {context.error}")
 
 def main():
-    # Set defaults to HTML to safely handle bold text and links
     defaults = Defaults(parse_mode=ParseMode.HTML)
-    
-    # Enable PicklePersistence to save conversation state on restart (Optional but recommended)
-    # persistence = PicklePersistence(filepath='bot_data') 
-    # app = Application.builder().token(TOKEN).defaults(defaults).persistence(persistence).build()
-    
     app = Application.builder().token(TOKEN).defaults(defaults).build()
     
     async def init(): await col_vaults.create_index("key", unique=True)
@@ -375,10 +380,12 @@ def main():
             MOV_NA: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_name)], 
             MOV_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], 
             MOV_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], MOV_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
-            A_V_FOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_sub)], A_V_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_post)], A_V_POST: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, v_desc)], A_V_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_files_start)], A_V_FILES: [MessageHandler(filters.ALL & ~filters.COMMAND, v_collect)],
+            A_V_FOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_sub)], A_V_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_post)], A_V_POST: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, v_desc)], A_V_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_files_start)], 
+            # FIXED: Added CommandHandler for /done here
+            A_V_FILES: [CommandHandler("done", v_collect), MessageHandler(filters.ALL & ~filters.COMMAND, v_collect)],
             AD_PHO_STATE: [MessageHandler((filters.PHOTO | filters.Regex("/skip")) & ~filters.COMMAND, ad_pho_fn)], AD_TXT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_txt_fn)], AD_LNK_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_lnk_fn)],
-            U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), guide_show)], 
-            U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), vault_select_sub)],
+            U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), guide_show)], 
+            U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), vault_select_sub)],
             V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
             ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
