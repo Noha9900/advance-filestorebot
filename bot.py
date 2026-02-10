@@ -63,7 +63,7 @@ async def get_settings():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() 
     w, _ = await get_settings()
-    kb = [[InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad")],
+    kb = [[InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad_0")], # Added page 0
           [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
           [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_vault_folders")]]
     markup = InlineKeyboardMarkup(kb)
@@ -94,21 +94,52 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "main": return await start(update, context)
 
-    # --- ADULT STREAM ---
-    if query.data == "u_ad":
+    # --- ADULT STREAM (PAGINATED) ---
+    if query.data.startswith("u_ad"):
+        page = int(query.data.split("_")[-1]) if "_" in query.data else 0
         _, ad = await get_settings()
-        kb = [[InlineKeyboardButton(c["name"], url=c["link"])] for c in ad.get("channels", [])]
+        channels = ad.get("channels", [])
+        
+        # Pagination: 8 items per page
+        ITEMS_PER_PAGE = 8
+        start_idx = page * ITEMS_PER_PAGE
+        end_idx = start_idx + ITEMS_PER_PAGE
+        current_batch = channels[start_idx:end_idx]
+        
+        kb = [[InlineKeyboardButton(c["name"], url=c["link"])] for c in current_batch]
+        
+        # Nav Buttons
+        nav = []
+        if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"u_ad_{page-1}"))
+        if end_idx < len(channels): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"u_ad_{page+1}"))
+        if nav: kb.append(nav)
+        
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         
-        if ad.get("photo"):
-            await query.message.delete()
-            await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
-        else:
-            if query.message.photo:
-                await query.message.delete()
-                await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+        # Message Handling
+        try:
+            if ad.get("photo"):
+                # If message has photo, edit caption/buttons
+                if query.message.photo:
+                    await query.edit_message_caption(caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await query.message.delete()
+                    await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
             else:
-                await query.edit_message_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                # Text mode
+                if query.message.photo:
+                    await query.message.delete()
+                    await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                else:
+                    await query.edit_message_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+        except Exception:
+            # Fallback if editing fails (e.g. message too old)
+            await query.message.delete()
+            if ad.get("photo"):
+                await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                
         return ConversationHandler.END
 
     # --- LISTS (ANIME/MOVIE) ---
@@ -335,10 +366,9 @@ async def guide_show(update, context):
 
 # --- DELETE & MISC ---
 async def admin_del_menu(update, context):
-    # FIXED: Added 'Back' button callback 'a_panel_back' to take admin home
     kb = [[InlineKeyboardButton("Anime", callback_data="del_anime"), InlineKeyboardButton("Movie", callback_data="del_movies")],
           [InlineKeyboardButton("Vault", callback_data="del_vault"), InlineKeyboardButton("Adult Link", callback_data="del_adult")],
-          [InlineKeyboardButton("🔙 Back to Admin", callback_data="a_panel_back")]]
+          [InlineKeyboardButton("🔙 Back", callback_data="a_back")]]
     await update.callback_query.edit_message_text("🗑 Select Category:", reply_markup=InlineKeyboardMarkup(kb)); return ADM_DEL_SELECT
 
 async def admin_del_process(update, context):
@@ -403,8 +433,7 @@ def main():
             U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), guide_show)], 
             U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), vault_select_sub)],
             V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
-            # FIXED: Added a_panel_back to allow exiting delete menu
-            ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_panel, pattern="^a_panel_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
+            ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
         fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel), CallbackQueryHandler(start, pattern="main")] + user_handlers,
         allow_reentry=True
