@@ -219,7 +219,6 @@ async def v_desc(update, context):
 
 async def v_files_start(update, context):
     context.user_data["v_data"]["desc"] = update.message.text
-    # Explicit instruction for bulk upload
     await update.message.reply_text("📎 <b>BULK UPLOAD MODE</b>\n\nSend videos, photos, or files one by one.\nWhen finished, type <code>/done</code> to save all under one key."); return A_V_FILES
 
 async def v_collect(update, context):
@@ -241,7 +240,6 @@ async def v_collect(update, context):
     fid, ftype = get_file_info(update.message)
     if fid: 
         context.user_data["v_data"]["files"].append({"id": fid, "type": ftype})
-        # Only confirm every 5th file to avoid spamming the admin during bulk upload
         count = len(context.user_data['v_data']['files'])
         if count % 5 == 0 or count == 1:
             await update.message.reply_text(f"✅ {count} files queued. Send more or /done")
@@ -265,7 +263,7 @@ async def ad_lnk_fn(update, context):
         await update.message.reply_text("✅ Added! Send next (Name | Link) or /start to finish."); return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
-# --- CONTENT DELIVERY (FAST BULK SEND) ---
+# --- CONTENT DELIVERY ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
@@ -289,27 +287,23 @@ async def vault_key_check(update, context):
         count = len(v['files'])
         status_msg = await update.message.reply_text(f"🔓 Key Accepted! Sending {count} files...\nPlease wait.")
         
-        for i, f in enumerate(v["files"]):
+        for f in v["files"]:
             if isinstance(f, dict): fid, ftype = f['id'], f.get('type', 'document')
             else: fid, ftype = f, 'unknown'
 
             try:
-                # Optimized Delay: Small delay prevents flood, but keeps it fast
                 await asyncio.sleep(0.05) 
-                
                 if ftype == 'video': msg = await update.message.reply_video(fid)
                 elif ftype == 'photo': msg = await update.message.reply_photo(fid)
                 elif ftype == 'animation': msg = await update.message.reply_animation(fid)
                 else: msg = await update.message.reply_document(fid) 
                 
-                # Individual Auto-Delete Timer for each file
                 context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
             except Exception as e:
-                # Fallback if specific type fails, try document
                 try: 
                     msg = await update.message.reply_document(fid)
                     context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
-                except: pass # Skip if file is totally invalid
+                except: pass 
                 
         await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg.message_id)
         await update.message.reply_text("✅ All files sent! They will disappear in 30 mins.")
@@ -341,9 +335,10 @@ async def guide_show(update, context):
 
 # --- DELETE & MISC ---
 async def admin_del_menu(update, context):
+    # FIXED: Added 'Back' button callback 'a_panel_back' to take admin home
     kb = [[InlineKeyboardButton("Anime", callback_data="del_anime"), InlineKeyboardButton("Movie", callback_data="del_movies")],
           [InlineKeyboardButton("Vault", callback_data="del_vault"), InlineKeyboardButton("Adult Link", callback_data="del_adult")],
-          [InlineKeyboardButton("🔙 Back", callback_data="a_back")]]
+          [InlineKeyboardButton("🔙 Back to Admin", callback_data="a_panel_back")]]
     await update.callback_query.edit_message_text("🗑 Select Category:", reply_markup=InlineKeyboardMarkup(kb)); return ADM_DEL_SELECT
 
 async def admin_del_process(update, context):
@@ -408,7 +403,8 @@ def main():
             U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), guide_show)], 
             U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), vault_select_sub)],
             V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
-            ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
+            # FIXED: Added a_panel_back to allow exiting delete menu
+            ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_panel, pattern="^a_panel_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
         fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel), CallbackQueryHandler(start, pattern="main")] + user_handlers,
         allow_reentry=True
