@@ -1,7 +1,5 @@
-pyrogram
-tgcrypto
+python-telegram-bot==20.x
 motor
-dnspython
-flask
-pytz
-requests
+pymongo
+openai
+python-dotenv
