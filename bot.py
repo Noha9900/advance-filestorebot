@@ -20,7 +20,6 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MONGO_URL = os.getenv("MONGO_URL")
 PORT = int(os.getenv("PORT", "8080"))
 
-# Production DB Connection with Keep-Alive
 client = AsyncIOMotorClient(MONGO_URL, maxPoolSize=10, minPoolSize=1, serverSelectionTimeoutMS=5000)
 db = client["vault_bot_db"]
 col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"]
@@ -86,7 +85,6 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "u_vault_folders":
         folders = await col_vaults.distinct("folder")
         btns = [InlineKeyboardButton(f, callback_data=f"vfold_{f}") for f in folders]
-        # Admin request: Buttons side-by-side (2 per row)
         kb = [btns[i:i + 2] for i in range(0, len(btns), 2)]
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         await query.edit_message_text("📂 Folders:", reply_markup=InlineKeyboardMarkup(kb))
@@ -107,7 +105,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
           [InlineKeyboardButton("Add Anime", callback_data="a_ani"), InlineKeyboardButton("Add Movie", callback_data="a_mov")],
           [InlineKeyboardButton("Create Vault Content 🔒", callback_data="a_v")],
           [InlineKeyboardButton("🗑 Delete Mode", callback_data="a_del")]]
-    await update.message.reply_text("🛠 **ADMIN PANEL**", reply_markup=InlineKeyboardMarkup(kb))
+    if update.callback_query: await update.callback_query.edit_message_text("🛠 **ADMIN PANEL**", reply_markup=InlineKeyboardMarkup(kb))
+    else: await update.message.reply_text("🛠 **ADMIN PANEL**", reply_markup=InlineKeyboardMarkup(kb))
     return ConversationHandler.END
 
 async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -137,13 +136,13 @@ async def save_g_name(update, context):
 
 async def save_g_media(update, context):
     fid = get_fid(update.message)
-    if not fid: await update.message.reply_text("❌ Send Photo/Video:"); return
+    if not fid: await update.message.reply_text("❌ Send Media:"); return
     context.user_data["gtmp"]["file"] = fid
     await update.message.reply_text("Send Description:"); return ANI_DE if context.user_data["p"]=="anime" else MOV_DE
 
 async def save_g_desc(update, context):
     context.user_data["gtmp"]["desc"] = update.message.text
-    await update.message.reply_text("Send Link:"); return ANI_LI if context.user_data["p"]=="anime" else MOV_LI
+    await update.message.reply_text("Send Watch Link:"); return ANI_LI if context.user_data["p"]=="anime" else MOV_LI
 
 async def save_g_final(update, context):
     context.user_data["gtmp"]["link"] = update.message.text
@@ -272,28 +271,32 @@ def main():
     async def init(): await col_vaults.create_index("key", unique=True)
     asyncio.get_event_loop().run_until_complete(init())
 
+    # --- HANDLER LOGIC FIXED: Global Entry + Fallback ---
+    # User buttons must be available GLOBALLY to prevent state locking.
+    user_handlers = [
+        CallbackQueryHandler(admin_router, pattern="^a_"), 
+        CallbackQueryHandler(user_router, pattern="^u_"), 
+        CallbackQueryHandler(user_router, pattern="^vfold_"),
+        CallbackQueryHandler(start, pattern="^main$"),
+        CallbackQueryHandler(admin_panel, pattern="^a_panel_back$")
+    ]
+
     conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            CommandHandler("admin", admin_panel),
-            CallbackQueryHandler(admin_router, pattern="^a_"), 
-            CallbackQueryHandler(user_router, pattern="^u_"), 
-            CallbackQueryHandler(user_router, pattern="^vfold_"),
-            CallbackQueryHandler(start, pattern="^main$"),
-            CallbackQueryHandler(admin_panel, pattern="^a_panel_back$")
-        ],
+        entry_points=[CommandHandler("start", start), CommandHandler("admin", admin_panel)] + user_handlers,
         states={
-            W_TXT: [MessageHandler(filters.TEXT, save_w_txt)], W_PHO: [MessageHandler(filters.PHOTO | filters.Regex("/skip"), save_w_pho)],
-            ANI_NA: [MessageHandler(filters.TEXT, save_g_name)], ANI_ME: [MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, save_g_media)], ANI_DE: [MessageHandler(filters.TEXT, save_g_desc)], ANI_LI: [MessageHandler(filters.TEXT, save_g_final)],
-            MOV_NA: [MessageHandler(filters.TEXT, save_g_name)], MOV_ME: [MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, save_g_media)], MOV_DE: [MessageHandler(filters.TEXT, save_g_desc)], MOV_LI: [MessageHandler(filters.TEXT, save_g_final)],
-            A_V_FOLD: [MessageHandler(filters.TEXT, v_sub)], A_V_SUB: [MessageHandler(filters.TEXT, v_post)], A_V_POST: [MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, v_desc)], A_V_DESC: [MessageHandler(filters.TEXT, v_files_start)], A_V_FILES: [MessageHandler(filters.ALL, v_collect)],
-            AD_PHO_STATE: [MessageHandler(filters.PHOTO | filters.Regex("/skip"), ad_pho_fn)], AD_TXT_STATE: [MessageHandler(filters.TEXT, ad_txt_fn)], AD_LNK_STATE: [MessageHandler(filters.TEXT, ad_lnk_fn)],
+            W_TXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_w_txt)], 
+            W_PHO: [MessageHandler((filters.PHOTO | filters.Regex("/skip")) & ~filters.COMMAND, save_w_pho)],
+            ANI_NA: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_name)], ANI_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], ANI_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], ANI_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
+            MOV_NA: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_name)], MOV_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], MOV_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], MOV_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
+            A_V_FOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_sub)], A_V_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_post)], A_V_POST: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, v_desc)], A_V_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_files_start)], A_V_FILES: [MessageHandler(filters.ALL & ~filters.COMMAND, v_collect)],
+            AD_PHO_STATE: [MessageHandler((filters.PHOTO | filters.Regex("/skip")) & ~filters.COMMAND, ad_pho_fn)], AD_TXT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_txt_fn)], AD_LNK_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_lnk_fn)],
             U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), guide_show)], 
             U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), vault_select_sub)],
-            V_KEY_INPUT: [MessageHandler(filters.TEXT, vault_key_check)], 
+            V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
             ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
-        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="main")], allow_reentry=True
+        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="main")] + user_handlers,
+        allow_reentry=True
     )
     app.add_handler(conv); app.add_handler(CommandHandler("start", start)); app.add_error_handler(error_handler)
     Thread(target=lambda: server.run(host='0.0.0.0', port=PORT)).start()
