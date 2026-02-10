@@ -39,7 +39,7 @@ col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"
 
 # --- SAFETY HELPER ---
 def get_file_info(message):
-    # Order matters: Animation > Video > Photo > Document
+    # Returns tuple: (file_id, media_type)
     if message.animation: return message.animation.file_id, "animation"
     if message.video: return message.video.file_id, "video"
     if message.photo: return message.photo[-1].file_id, "photo"
@@ -203,7 +203,7 @@ async def save_g_final(update, context):
     await col_guides.insert_one(context.user_data["gtmp"])
     await update.message.reply_text("✅ Added!"); return ConversationHandler.END
 
-# --- VAULT SAVING (FIXED /done) ---
+# --- VAULT SAVING (BULK & TYPE SAFE) ---
 async def v_sub(update, context):
     context.user_data["v_data"] = {"folder": update.message.text, "files": []}
     await update.message.reply_text("📝 Sub-Name (e.g. Episode 1):"); return A_V_SUB
@@ -220,25 +220,30 @@ async def v_desc(update, context):
 
 async def v_files_start(update, context):
     context.user_data["v_data"]["desc"] = update.message.text
-    await update.message.reply_text("📎 Send Files. Type /done when finished:"); return A_V_FILES
+    # Explicit instruction for bulk upload
+    await update.message.reply_text("📎 <b>BULK UPLOAD MODE</b>\n\nSend videos, photos, or files one by one.\nWhen finished, type <code>/done</code> to save all under one key."); return A_V_FILES
 
 async def v_collect(update, context):
-    # Logic to handle both Command and Text input for '/done'
     msg_text = update.message.text or ""
+    # Finish and Save
     if msg_text.lower() == "/done":
         if "v_data" not in context.user_data:
             await update.message.reply_text("❌ Session expired. Start over."); return ConversationHandler.END
+        
+        if not context.user_data["v_data"]["files"]:
+            await update.message.reply_text("❌ No files added! Send files first."); return A_V_FILES
             
         key = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*") for _ in range(12))
         context.user_data["v_data"]["key"] = key
         await col_vaults.insert_one(context.user_data["v_data"])
-        await update.message.reply_text(f"✅ Saved!\nFolder: {context.user_data['v_data']['folder']}\nKey: <code>{key}</code>"); return ConversationHandler.END
+        await update.message.reply_text(f"✅ <b>Bulk Saved!</b>\n\n📂 Folder: {context.user_data['v_data']['folder']}\n📄 Files: {len(context.user_data['v_data']['files'])}\n🔑 Key: <code>{key}</code>"); return ConversationHandler.END
     
-    # File capture logic
-    fid = get_fid(update.message)
+    # Capture File with Type
+    fid, ftype = get_file_info(update.message)
     if fid: 
-        context.user_data["v_data"]["files"].append(fid)
-        await update.message.reply_text(f"✅ File {len(context.user_data['v_data']['files'])} added. Send more or /done")
+        # Store dict to remember type for correct delivery later
+        context.user_data["v_data"]["files"].append({"id": fid, "type": ftype})
+        await update.message.reply_text(f"✅ Added file #{len(context.user_data['v_data']['files'])} ({ftype}).\nSend more or type /done")
     else: 
         await update.message.reply_text("❌ Not a file. Send file or /done")
     return A_V_FILES
@@ -259,7 +264,7 @@ async def ad_lnk_fn(update, context):
         await update.message.reply_text("✅ Added! Send next (Name | Link) or /start to finish."); return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
-# --- CONTENT DELIVERY (FIXED) ---
+# --- CONTENT DELIVERY (SMART BULK) ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
@@ -280,10 +285,25 @@ async def vault_select_sub(update, context):
 async def vault_key_check(update, context):
     v = await col_vaults.find_one({"_id": ObjectId(context.user_data.get("target_v"))})
     if v and update.message.text.strip() == v["key"]:
-        await update.message.reply_text("🔓 Unlocked! Files auto-delete in 30m.")
+        await update.message.reply_text(f"🔓 Unlocked! Sending {len(v['files'])} files...\nThey will auto-delete in 30 mins.")
+        
         for f in v["files"]:
-            try: msg = await update.message.reply_video(f)
-            except: msg = await update.message.reply_document(f)
+            # Handle both old format (string ID) and new format (dict with type)
+            if isinstance(f, dict):
+                fid = f['id']
+                ftype = f.get('type', 'document')
+            else:
+                fid = f
+                ftype = 'unknown'
+
+            try:
+                if ftype == 'video': msg = await update.message.reply_video(fid)
+                elif ftype == 'photo': msg = await update.message.reply_photo(fid)
+                elif ftype == 'animation': msg = await update.message.reply_animation(fid)
+                else: msg = await update.message.reply_document(fid) # Fallback / Document
+            except:
+                msg = await update.message.reply_document(fid) # Ultimate fallback
+            
             context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
     else: await update.message.reply_text("❌ Wrong Key")
     return ConversationHandler.END
@@ -298,18 +318,12 @@ async def guide_show(update, context):
             caption = f"⭐ <b>{item['name']}</b>\n\n{item['desc']}\n\n🔗 Watch: {item['link']}"
             mtype = item.get("media_type", "photo") 
             
-            # Safe Sending Logic (Fallback to Document if type mismatch)
             try:
-                if mtype == "video":
-                    await update.message.reply_video(item["file"], caption=caption)
-                elif mtype == "animation":
-                    await update.message.reply_animation(item["file"], caption=caption)
-                elif mtype == "document":
-                    await update.message.reply_document(item["file"], caption=caption)
-                else:
-                    await update.message.reply_photo(item["file"], caption=caption)
-            except Exception as e:
-                # Fallback if Telegram rejects the file type (e.g. Video sent as Photo)
+                if mtype == "video": await update.message.reply_video(item["file"], caption=caption)
+                elif mtype == "animation": await update.message.reply_animation(item["file"], caption=caption)
+                elif mtype == "document": await update.message.reply_document(item["file"], caption=caption)
+                else: await update.message.reply_photo(item["file"], caption=caption)
+            except:
                 await update.message.reply_document(item["file"], caption=caption)
         else: 
             await update.message.reply_text(f"❌ Invalid Number. 1-{len(items)}")
@@ -381,7 +395,7 @@ def main():
             MOV_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], 
             MOV_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], MOV_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
             A_V_FOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_sub)], A_V_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_post)], A_V_POST: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, v_desc)], A_V_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_files_start)], 
-            # FIXED: Added CommandHandler for /done here
+            # FIXED: Supports Bulk Upload & Type Storage
             A_V_FILES: [CommandHandler("done", v_collect), MessageHandler(filters.ALL & ~filters.COMMAND, v_collect)],
             AD_PHO_STATE: [MessageHandler((filters.PHOTO | filters.Regex("/skip")) & ~filters.COMMAND, ad_pho_fn)], AD_TXT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_txt_fn)], AD_LNK_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_lnk_fn)],
             U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), guide_show)], 
