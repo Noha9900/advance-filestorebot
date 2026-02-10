@@ -63,7 +63,8 @@ async def get_settings():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() 
     w, _ = await get_settings()
-    kb = [[InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad_0")], # Added page 0
+    # Updated callback for pagination entry point
+    kb = [[InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad_0")], 
           [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
           [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_vault_folders")]]
     markup = InlineKeyboardMarkup(kb)
@@ -116,30 +117,27 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         
-        # Message Handling
+        # Message Handling Logic
         try:
             if ad.get("photo"):
-                # If message has photo, edit caption/buttons
                 if query.message.photo:
                     await query.edit_message_caption(caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
                 else:
                     await query.message.delete()
                     await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
             else:
-                # Text mode
                 if query.message.photo:
                     await query.message.delete()
                     await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
                 else:
                     await query.edit_message_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
         except Exception:
-            # Fallback if editing fails (e.g. message too old)
+            # Safe Fallback
             await query.message.delete()
             if ad.get("photo"):
                 await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
             else:
                 await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
-                
         return ConversationHandler.END
 
     # --- LISTS (ANIME/MOVIE) ---
@@ -183,7 +181,9 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ADMIN PANEL ---
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # CRITICAL: Verify Admin ID
     if update.effective_user.id != ADMIN_ID: return
+    
     kb = [[InlineKeyboardButton("Set Welcome", callback_data="a_w"), InlineKeyboardButton("Set Adult", callback_data="a_ad")],
           [InlineKeyboardButton("Add Anime", callback_data="a_ani"), InlineKeyboardButton("Add Movie", callback_data="a_mov")],
           [InlineKeyboardButton("Create Vault Content 🔒", callback_data="a_v")],
@@ -233,7 +233,7 @@ async def save_g_final(update, context):
     await col_guides.insert_one(context.user_data["gtmp"])
     await update.message.reply_text("✅ Added!"); return ConversationHandler.END
 
-# --- VAULT SAVING (BULK & TYPE SAFE) ---
+# --- VAULT SAVING ---
 async def v_sub(update, context):
     context.user_data["v_data"] = {"folder": update.message.text, "files": []}
     await update.message.reply_text("📝 Sub-Name (e.g. Episode 1):"); return A_V_SUB
@@ -254,7 +254,6 @@ async def v_files_start(update, context):
 
 async def v_collect(update, context):
     msg_text = update.message.text or ""
-    # Finish and Save
     if msg_text.lower() == "/done":
         if "v_data" not in context.user_data:
             await update.message.reply_text("❌ Session expired. Start over."); return ConversationHandler.END
@@ -267,7 +266,6 @@ async def v_collect(update, context):
         await col_vaults.insert_one(context.user_data["v_data"])
         await update.message.reply_text(f"✅ <b>Bulk Saved!</b>\n\n📂 Folder: {context.user_data['v_data']['folder']}\n📄 Files: {len(context.user_data['v_data']['files'])}\n🔑 Key: <code>{key}</code>"); return ConversationHandler.END
     
-    # Capture File with Type
     fid, ftype = get_file_info(update.message)
     if fid: 
         context.user_data["v_data"]["files"].append({"id": fid, "type": ftype})
@@ -330,7 +328,7 @@ async def vault_key_check(update, context):
                 else: msg = await update.message.reply_document(fid) 
                 
                 context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
-            except Exception as e:
+            except Exception:
                 try: 
                     msg = await update.message.reply_document(fid)
                     context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
@@ -408,16 +406,20 @@ def main():
     async def init(): await col_vaults.create_index("key", unique=True)
     asyncio.get_event_loop().run_until_complete(init())
 
-    user_handlers = [
-        CallbackQueryHandler(admin_router, pattern="^a_"), 
-        CallbackQueryHandler(user_router, pattern="^u_"), 
-        CallbackQueryHandler(user_router, pattern="^vfold_"),
+    # GLOBAL Handlers to ensure commands always work
+    global_handlers = [
+        CommandHandler("start", start),
+        CommandHandler("admin", admin_panel),
+        CommandHandler("cancel", cancel),
         CallbackQueryHandler(start, pattern="^main$"),
-        CallbackQueryHandler(admin_panel, pattern="^a_panel_back$")
+        CallbackQueryHandler(admin_panel, pattern="^a_panel_back$"),
+        CallbackQueryHandler(user_router, pattern="^u_"),
+        CallbackQueryHandler(user_router, pattern="^vfold_"),
+        CallbackQueryHandler(admin_router, pattern="^a_")
     ]
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start), CommandHandler("admin", admin_panel)] + user_handlers,
+        entry_points=global_handlers,
         states={
             W_TXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_w_txt)], 
             W_PHO: [MessageHandler((filters.PHOTO | filters.Regex("/skip")) & ~filters.COMMAND, save_w_pho)],
@@ -435,10 +437,11 @@ def main():
             V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
             ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
-        fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel), CallbackQueryHandler(start, pattern="main")] + user_handlers,
+        fallbacks=global_handlers, # Fallbacks are now the same as entry points to ensure instant switch
         allow_reentry=True
     )
-    app.add_handler(conv); app.add_handler(CommandHandler("start", start)); app.add_error_handler(error_handler)
+    app.add_handler(conv)
+    app.add_error_handler(error_handler)
     Thread(target=lambda: server.run(host='0.0.0.0', port=PORT)).start()
     app.run_polling(drop_pending_updates=True)
 
