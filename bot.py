@@ -65,7 +65,7 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.data == "u_ad":
         _, ad = await get_settings()
-        kb = [[InlineKeyboardButton(c["name"], url=c["link"])] for c in ad["channels"]]
+        kb = [[InlineKeyboardButton(c["name"], url=c["link"])] for c in ad.get("channels", [])]
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         if ad.get("photo"): await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
         else: await query.edit_message_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
@@ -88,8 +88,8 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="u_vault_folders")]]))
         return U_V_SUB_SELECT
 
-# --- ADMIN PANEL ---
-async def admin_panel(update, context):
+# --- ADMIN FUNCTIONS ---
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     kb = [[InlineKeyboardButton("Set Welcome", callback_data="a_w"), InlineKeyboardButton("Set Adult", callback_data="a_ad")],
           [InlineKeyboardButton("Add Anime", callback_data="a_ani"), InlineKeyboardButton("Add Movie", callback_data="a_mov")],
@@ -97,17 +97,17 @@ async def admin_panel(update, context):
           [InlineKeyboardButton("🗑 Delete Mode", callback_data="a_del")]]
     await update.message.reply_text("🛠 **ADMIN PANEL**", reply_markup=InlineKeyboardMarkup(kb))
 
-async def admin_router(update, context):
+async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "a_w": await query.edit_message_text("Send Welcome Text:"); return W_TXT
-    if query.data == "a_ad": await query.edit_message_text("Adult Photo (or /skip):"); return AD_PHO
+    if query.data == "a_ad": await query.edit_message_text("Adult Setup: Photo (or /skip):"); return AD_PHO
     if query.data == "a_ani": context.user_data["p"]="anime"; await query.edit_message_text("Anime Name:"); return ANI_NA
     if query.data == "a_mov": context.user_data["p"]="movies"; await query.edit_message_text("Movie Name:"); return MOV_NA
     if query.data == "a_v": await query.edit_message_text("📂 Folder Name:"); return A_V_FOLD
     if query.data == "a_del": return await admin_del_menu(update, context)
 
-# --- REFINED SAVING LOGIC ---
+# --- ADMIN SAVING LOGICS ---
 async def save_w_txt(update, context):
     context.user_data["wt"] = update.message.text
     await update.message.reply_text("Send Photo (or /skip):"); return W_PHO
@@ -123,13 +123,13 @@ async def save_g_name(update, context):
 
 async def save_g_media(update, context):
     fid = get_fid(update.message)
-    if not fid: await update.message.reply_text("❌ Send Photo/Video:"); return
+    if not fid: await update.message.reply_text("❌ Send Media:"); return
     context.user_data["gtmp"]["file"] = fid
     await update.message.reply_text("Send Description:"); return ANI_DE if context.user_data["p"]=="anime" else MOV_DE
 
 async def save_g_desc(update, context):
     context.user_data["gtmp"]["desc"] = update.message.text
-    await update.message.reply_text("Send Link:"); return ANI_LI if context.user_data["p"]=="anime" else MOV_LI
+    await update.message.reply_text("Send Watch Link:"); return ANI_LI if context.user_data["p"]=="anime" else MOV_LI
 
 async def save_g_final(update, context):
     context.user_data["gtmp"]["link"] = update.message.text
@@ -142,7 +142,7 @@ async def v_sub(update, context):
 
 async def v_post(update, context):
     context.user_data["v_data"]["sub_name"] = update.message.text
-    await update.message.reply_text("🖼 Send Poster:"); return A_V_POST
+    await update.message.reply_text("🖼 Send Poster Media:"); return A_V_POST
 
 async def v_desc(update, context):
     fid = get_fid(update.message)
@@ -167,34 +167,34 @@ async def v_collect(update, context):
 async def ad_pho(update, context):
     fid = update.message.photo[-1].file_id if update.message.photo else None
     context.user_data["ad_tmp"] = {"photo": fid}
-    await update.message.reply_text("Adult Welcome Text:"); return AD_TXT
+    await update.message.reply_text("Send Adult Welcome Text:"); return AD_TXT
 
 async def ad_txt(update, context):
     context.user_data["ad_tmp"]["text"] = update.message.text
-    await update.message.reply_text("Channel (Name | Link):"); return AD_LNK
+    await update.message.reply_text("Send Channel (Format: Name | Link):"); return AD_LNK
 
 async def ad_lnk(update, context):
     try:
         parts = update.message.text.split("|")
         await col_settings.update_one({"type": "adult"}, {"$set": {"photo": context.user_data["ad_tmp"]["photo"], "text": context.user_data["ad_tmp"]["text"]}, "$push": {"channels": {"name": parts[0].strip(), "link": parts[1].strip()}}}, upsert=True)
-        await update.message.reply_text("✅ Added! Add more or /start to finish:"); return AD_LNK
-    except: await update.message.reply_text("Err: Name | Link"); return AD_LNK
+        await update.message.reply_text("✅ Link Added! Click /start to finish or add more Name | Link:"); return AD_LNK
+    except: await update.message.reply_text("Format error (Name | Link)."); return AD_LNK
 
-# --- ACCESS LOGICS ---
+# --- ACCESS & DELETE ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
         items = await col_vaults.find({"folder": context.user_data["active_vault_folder"]}).to_list(100)
         if 0 <= idx < len(items):
             context.user_data["target_v"] = items[idx]["_id"]
-            await update.message.reply_text(f"🖼 {items[idx]['sub_name']}\n{items[idx]['desc']}\n\n🔐 Enter Key:")
+            await update.message.reply_text(f"🖼 **{items[idx]['sub_name']}**\n\n{items[idx]['desc']}\n\n🔐 Enter Special Key to Unlock Files:")
             return V_KEY_INPUT
     except: await update.message.reply_text("Invalid Number")
 
 async def vault_key_check(update, context):
     v = await col_vaults.find_one({"_id": ObjectId(context.user_data["target_v"])})
     if v and update.message.text == v["key"]:
-        await update.message.reply_photo(v["poster"], caption="🔓 Unlocked!")
+        await update.message.reply_photo(v["poster"], caption="🔓 Unlocked! Files are deleting in 30 mins.")
         for f in v["files"]:
             msg = await update.message.reply_document(f) if "document" in str(f) else await update.message.reply_video(f)
             context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
@@ -207,27 +207,36 @@ async def guide_show(update, context):
         items = await col_guides.find({"type": context.user_data["view_type"]}).to_list(100)
         if 0 <= idx < len(items):
             item = items[idx]
-            await update.message.reply_photo(item["file"], caption=f"⭐ {item['name']}\n\n{item['desc']}\n\n🔗 {item['link']}")
-            return U_GUIDE_SELECT
+            await update.message.reply_photo(item["file"], caption=f"⭐ **{item['name']}**\n\n{item['desc']}\n\n🔗 Watch Link: {item['link']}")
     except: await update.message.reply_text("Invalid Number")
     return U_GUIDE_SELECT
 
-# --- DELETE ---
 async def admin_del_menu(update, context):
-    kb = [[InlineKeyboardButton("Anime", callback_data="del_anime"), InlineKeyboardButton("Movie", callback_data="del_movies")],
-          [InlineKeyboardButton("Vault", callback_data="del_vault"), InlineKeyboardButton("Adult Link", callback_data="del_adult")]]
-    await update.callback_query.edit_message_text("🗑 Select Category:", reply_markup=InlineKeyboardMarkup(kb)); return ADM_DEL_SELECT
+    kb = [[InlineKeyboardButton("Anime Guide", callback_data="del_anime"), InlineKeyboardButton("Movie Guide", callback_data="del_movies")],
+          [InlineKeyboardButton("Vault Folder", callback_data="del_vault"), InlineKeyboardButton("Adult link", callback_data="del_adult")]]
+    await update.callback_query.edit_message_text("🗑 Select Category to Delete from:", reply_markup=InlineKeyboardMarkup(kb)); return ADM_DEL_SELECT
 
 async def admin_del_process(update, context):
     dtype = update.callback_query.data.split("_")[1]
     context.user_data["del_type"] = dtype
-    col = col_guides if dtype in ["anime", "movies"] else col_vaults
-    items = await col.find({"type": dtype} if dtype in ["anime", "movies"] else {}).to_list(100)
-    kb = [[InlineKeyboardButton(x.get("name") or x.get("sub_name"), callback_data=f"confirm_del_{x['_id']}")] for x in items]
-    await update.callback_query.edit_message_text("Select to delete:", reply_markup=InlineKeyboardMarkup(kb))
+    if dtype == "adult":
+        _, ad = await get_settings()
+        kb = [[InlineKeyboardButton(c["name"], callback_data=f"confirm_del_{i}")] for i, c in enumerate(ad["channels"])]
+    else:
+        col = col_guides if dtype in ["anime", "movies"] else col_vaults
+        items = await col.find({"type": dtype} if dtype != "vault" else {}).to_list(100)
+        kb = [[InlineKeyboardButton(x.get("name") or x.get("sub_name"), callback_data=f"confirm_del_{x['_id']}")] for x in items]
+    await update.callback_query.edit_message_text("Select item to delete permanently:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def admin_confirm_delete(update, context):
-    await (col_guides if context.user_data["del_type"] in ["anime", "movies"] else col_vaults).delete_one({"_id": ObjectId(update.callback_query.data.split("_")[-1])})
+    oid = update.callback_query.data.split("_")[-1]
+    dtype = context.user_data["del_type"]
+    if dtype == "adult":
+        await col_settings.update_one({"type": "adult"}, {"$unset": {f"channels.{int(oid)}": 1}})
+        await col_settings.update_one({"type": "adult"}, {"$pull": {"channels": None}})
+    else:
+        col = col_guides if dtype in ["anime", "movies"] else col_vaults
+        await col.delete_one({"_id": ObjectId(oid)})
     await update.callback_query.edit_message_text("✅ Deleted!"); return ConversationHandler.END
 
 # --- APP ---
@@ -235,18 +244,14 @@ server = Flask(__name__)
 @server.route('/')
 def h(): return "OK"
 
-async def error_handler(update, context): logger.error(f"Error: {context.error}")
-
 def main():
     app = Application.builder().token(TOKEN).build()
     
-    # Secure Threaded Database Initialization
-    async def init(): 
-        await col_vaults.create_index("key", unique=True)
+    async def init(): await col_vaults.create_index("key", unique=True)
     asyncio.get_event_loop().run_until_complete(init())
 
     conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_router, pattern="^a_"), CallbackQueryHandler(user_router, pattern="^u_"), CallbackQueryHandler(user_router, pattern="^vfold_")],
+        entry_points=[CallbackQueryHandler(admin_router, pattern="^a_"), CallbackQueryHandler(user_router, pattern="^u_"), CallbackQueryHandler(user_router, pattern="^vfold_"), CommandHandler("admin", admin_panel)],
         states={
             W_TXT: [MessageHandler(filters.TEXT, save_w_txt)], W_PHO: [MessageHandler(filters.PHOTO | filters.Regex("/skip"), save_w_pho)],
             ANI_NA: [MessageHandler(filters.TEXT, save_g_name)], ANI_ME: [MessageHandler(filters.PHOTO | filters.VIDEO | filters.Document.ALL, save_g_media)], ANI_DE: [MessageHandler(filters.TEXT, save_g_desc)], ANI_LI: [MessageHandler(filters.TEXT, save_g_final)],
@@ -258,7 +263,7 @@ def main():
         },
         fallbacks=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="main")], allow_reentry=True
     )
-    app.add_handler(conv); app.add_handler(CommandHandler("admin", admin_panel)); app.add_handler(CommandHandler("start", start)); app.add_error_handler(error_handler)
+    app.add_handler(conv); app.add_handler(CommandHandler("start", start))
     Thread(target=lambda: server.run(host='0.0.0.0', port=PORT)).start()
     app.run_polling(drop_pending_updates=True)
 
