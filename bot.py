@@ -39,7 +39,7 @@ col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"
 
 # --- SAFETY HELPER ---
 def get_file_info(message):
-    # Returns tuple: (file_id, media_type)
+    # Order matters: Animation > Video > Photo > Document
     if message.animation: return message.animation.file_id, "animation"
     if message.video: return message.video.file_id, "video"
     if message.photo: return message.photo[-1].file_id, "photo"
@@ -264,7 +264,7 @@ async def ad_lnk_fn(update, context):
         await update.message.reply_text("✅ Added! Send next (Name | Link) or /start to finish."); return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
-# --- CONTENT DELIVERY (SMART BULK) ---
+# --- CONTENT DELIVERY (FIXED BULK SENDING) ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
@@ -284,6 +284,7 @@ async def vault_select_sub(update, context):
 
 async def vault_key_check(update, context):
     v = await col_vaults.find_one({"_id": ObjectId(context.user_data.get("target_v"))})
+    
     if v and update.message.text.strip() == v["key"]:
         await update.message.reply_text(f"🔓 Unlocked! Sending {len(v['files'])} files...\nThey will auto-delete in 30 mins.")
         
@@ -297,12 +298,15 @@ async def vault_key_check(update, context):
                 ftype = 'unknown'
 
             try:
+                # Add DELAY to prevent Telegram FloodWait error on bulk sending
+                await asyncio.sleep(0.5) 
+                
                 if ftype == 'video': msg = await update.message.reply_video(fid)
                 elif ftype == 'photo': msg = await update.message.reply_photo(fid)
                 elif ftype == 'animation': msg = await update.message.reply_animation(fid)
-                else: msg = await update.message.reply_document(fid) # Fallback / Document
+                else: msg = await update.message.reply_document(fid) 
             except:
-                msg = await update.message.reply_document(fid) # Ultimate fallback
+                msg = await update.message.reply_document(fid) 
             
             context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
     else: await update.message.reply_text("❌ Wrong Key")
