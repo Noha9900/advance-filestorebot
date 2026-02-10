@@ -2,6 +2,7 @@ import os, asyncio, secrets, logging
 from datetime import datetime
 from flask import Flask
 from threading import Thread
+import certifi # ADDED: Required for Cloud MongoDB connections
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
@@ -20,7 +21,14 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MONGO_URL = os.getenv("MONGO_URL")
 PORT = int(os.getenv("PORT", "8080"))
 
-client = AsyncIOMotorClient(MONGO_URL, maxPoolSize=10, minPoolSize=1, serverSelectionTimeoutMS=5000)
+# ADDED: tlsCAFile is crucial for Render/Heroku to connect to Atlas
+client = AsyncIOMotorClient(
+    MONGO_URL, 
+    maxPoolSize=10, 
+    minPoolSize=1, 
+    serverSelectionTimeoutMS=5000,
+    tlsCAFile=certifi.where() 
+)
 db = client["vault_bot_db"]
 col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"]
 
@@ -59,6 +67,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         try: await update.callback_query.edit_message_text(w["text"], reply_markup=markup)
         except: await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text("❌ Operation Cancelled. Type /start to begin.")
     return ConversationHandler.END
 
 async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -232,7 +245,7 @@ async def guide_show(update, context):
 async def admin_del_menu(update, context):
     kb = [[InlineKeyboardButton("Anime", callback_data="del_anime"), InlineKeyboardButton("Movie", callback_data="del_movies")],
           [InlineKeyboardButton("Vault", callback_data="del_vault"), InlineKeyboardButton("Adult Link", callback_data="del_adult")],
-          [InlineKeyboardButton("🔙 Back to Admin", callback_data="a_panel_back")]]
+          [InlineKeyboardButton("🔙 Back", callback_data="a_panel_back")]]
     await update.callback_query.edit_message_text("🗑 Select Category:", reply_markup=InlineKeyboardMarkup(kb)); return ADM_DEL_SELECT
 
 async def admin_del_process(update, context):
@@ -271,8 +284,7 @@ def main():
     async def init(): await col_vaults.create_index("key", unique=True)
     asyncio.get_event_loop().run_until_complete(init())
 
-    # --- HANDLER LOGIC FIXED: Global Entry + Fallback ---
-    # User buttons must be available GLOBALLY to prevent state locking.
+    # --- HANDLER LOGIC ---
     user_handlers = [
         CallbackQueryHandler(admin_router, pattern="^a_"), 
         CallbackQueryHandler(user_router, pattern="^u_"), 
@@ -293,9 +305,10 @@ def main():
             U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), guide_show)], 
             U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), vault_select_sub)],
             V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
-            ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
+            # ADDED: a_panel_back handler here so admins can exit the delete menu
+            ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_panel, pattern="^a_panel_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
-        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="main")] + user_handlers,
+        fallbacks=[CommandHandler("start", start), CommandHandler("cancel", cancel), CallbackQueryHandler(start, pattern="main")] + user_handlers,
         allow_reentry=True
     )
     app.add_handler(conv); app.add_handler(CommandHandler("start", start)); app.add_error_handler(error_handler)
