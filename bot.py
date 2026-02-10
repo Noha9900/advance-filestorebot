@@ -3,7 +3,7 @@ from datetime import datetime
 from flask import Flask
 from threading import Thread
 import certifi 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputMediaPhoto
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
@@ -63,7 +63,6 @@ async def get_settings():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() 
     w, _ = await get_settings()
-    # Updated callback for pagination entry point
     kb = [[InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad_0")], 
           [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
           [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_vault_folders")]]
@@ -76,12 +75,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
         context.job_queue.run_once(del_msg, 60, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
-        try: await update.callback_query.message.delete()
-        except: pass
-        if w.get("photo"):
-            await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
-        else:
-            await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
+        # Check if we need to swap media back to welcome photo
+        try:
+            if w.get("photo"):
+                if update.callback_query.message.photo:
+                    # If it's already a photo, swap it (Smoother)
+                    await update.callback_query.edit_message_media(
+                        media=InputMediaPhoto(media=w["photo"], caption=w["text"]),
+                        reply_markup=markup
+                    )
+                else:
+                    # Text to Photo
+                    await update.callback_query.message.delete()
+                    await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
+            else:
+                # Text only
+                if update.callback_query.message.photo:
+                    await update.callback_query.message.delete()
+                    await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
+                else:
+                    await update.callback_query.edit_message_text(w["text"], reply_markup=markup)
+        except:
+            # Absolute fallback
+            try: await update.callback_query.message.delete()
+            except: pass
+            if w.get("photo"):
+                await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
+            else:
+                await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
+
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -95,13 +117,12 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "main": return await start(update, context)
 
-    # --- ADULT STREAM (PAGINATED) ---
+    # --- ADULT STREAM (FIXED MEDIA SWAP) ---
     if query.data.startswith("u_ad"):
         page = int(query.data.split("_")[-1]) if "_" in query.data else 0
         _, ad = await get_settings()
         channels = ad.get("channels", [])
         
-        # Pagination: 8 items per page
         ITEMS_PER_PAGE = 8
         start_idx = page * ITEMS_PER_PAGE
         end_idx = start_idx + ITEMS_PER_PAGE
@@ -109,35 +130,44 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         kb = [[InlineKeyboardButton(c["name"], url=c["link"])] for c in current_batch]
         
-        # Nav Buttons
         nav = []
         if page > 0: nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"u_ad_{page-1}"))
         if end_idx < len(channels): nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"u_ad_{page+1}"))
         if nav: kb.append(nav)
         
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
+        markup = InlineKeyboardMarkup(kb)
         
-        # Message Handling Logic
+        # LOGIC FIX: Explicitly swap media using InputMediaPhoto
         try:
             if ad.get("photo"):
                 if query.message.photo:
-                    await query.edit_message_caption(caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                    # Photo -> New Photo (Swap)
+                    await query.edit_message_media(
+                        media=InputMediaPhoto(media=ad["photo"], caption=ad["text"]),
+                        reply_markup=markup
+                    )
                 else:
+                    # Text -> Photo (Delete & Send)
                     await query.message.delete()
-                    await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                    await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=markup)
             else:
+                # Target is Text
                 if query.message.photo:
+                    # Photo -> Text (Delete & Send)
                     await query.message.delete()
-                    await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                    await query.message.reply_text(ad["text"], reply_markup=markup)
                 else:
-                    await query.edit_message_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
-        except Exception:
-            # Safe Fallback
+                    # Text -> Text (Edit)
+                    await query.edit_message_text(ad["text"], reply_markup=markup)
+        except Exception as e:
+            # Fallback for any API errors
             await query.message.delete()
             if ad.get("photo"):
-                await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=markup)
             else:
-                await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+                await query.message.reply_text(ad["text"], reply_markup=markup)
+                
         return ConversationHandler.END
 
     # --- LISTS (ANIME/MOVIE) ---
@@ -181,7 +211,6 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ADMIN PANEL ---
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # CRITICAL: Verify Admin ID
     if update.effective_user.id != ADMIN_ID: return
     
     kb = [[InlineKeyboardButton("Set Welcome", callback_data="a_w"), InlineKeyboardButton("Set Adult", callback_data="a_ad")],
@@ -289,7 +318,14 @@ async def ad_lnk_fn(update, context):
     try:
         parts = update.message.text.split("|")
         await col_settings.update_one({"type": "adult"}, {"$set": {"photo": context.user_data["ad_tmp"]["photo"], "text": context.user_data["ad_tmp"]["text"]}, "$push": {"channels": {"name": parts[0].strip(), "link": parts[1].strip()}}}, upsert=True)
-        await update.message.reply_text("✅ Added! Send next (Name | Link) or /start to finish."); return AD_LNK_STATE
+        # SHOW PREVIEW TO ADMIN
+        await update.message.reply_text("✅ <b>Saved! Preview:</b>")
+        if context.user_data["ad_tmp"]["photo"]:
+            await update.message.reply_photo(context.user_data["ad_tmp"]["photo"], caption=context.user_data["ad_tmp"]["text"])
+        else:
+            await update.message.reply_text(context.user_data["ad_tmp"]["text"])
+        await update.message.reply_text("Send next (Name | Link) or /start to finish.")
+        return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
 # --- CONTENT DELIVERY ---
@@ -406,7 +442,6 @@ def main():
     async def init(): await col_vaults.create_index("key", unique=True)
     asyncio.get_event_loop().run_until_complete(init())
 
-    # GLOBAL Handlers to ensure commands always work
     global_handlers = [
         CommandHandler("start", start),
         CommandHandler("admin", admin_panel),
@@ -437,7 +472,7 @@ def main():
             V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
             ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
-        fallbacks=global_handlers, # Fallbacks are now the same as entry points to ensure instant switch
+        fallbacks=global_handlers,
         allow_reentry=True
     )
     app.add_handler(conv)
