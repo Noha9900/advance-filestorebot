@@ -39,7 +39,6 @@ col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"
 
 # --- SAFETY HELPER ---
 def get_file_info(message):
-    # Order matters: Animation > Video > Photo > Document
     if message.animation: return message.animation.file_id, "animation"
     if message.video: return message.video.file_id, "video"
     if message.photo: return message.photo[-1].file_id, "photo"
@@ -241,9 +240,11 @@ async def v_collect(update, context):
     # Capture File with Type
     fid, ftype = get_file_info(update.message)
     if fid: 
-        # Store dict to remember type for correct delivery later
         context.user_data["v_data"]["files"].append({"id": fid, "type": ftype})
-        await update.message.reply_text(f"✅ Added file #{len(context.user_data['v_data']['files'])} ({ftype}).\nSend more or type /done")
+        # Only confirm every 5th file to avoid spamming the admin during bulk upload
+        count = len(context.user_data['v_data']['files'])
+        if count % 5 == 0 or count == 1:
+            await update.message.reply_text(f"✅ {count} files queued. Send more or /done")
     else: 
         await update.message.reply_text("❌ Not a file. Send file or /done")
     return A_V_FILES
@@ -264,7 +265,7 @@ async def ad_lnk_fn(update, context):
         await update.message.reply_text("✅ Added! Send next (Name | Link) or /start to finish."); return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
-# --- CONTENT DELIVERY (FIXED BULK SENDING) ---
+# --- CONTENT DELIVERY (FAST BULK SEND) ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
@@ -284,31 +285,34 @@ async def vault_select_sub(update, context):
 
 async def vault_key_check(update, context):
     v = await col_vaults.find_one({"_id": ObjectId(context.user_data.get("target_v"))})
-    
     if v and update.message.text.strip() == v["key"]:
-        await update.message.reply_text(f"🔓 Unlocked! Sending {len(v['files'])} files...\nThey will auto-delete in 30 mins.")
+        count = len(v['files'])
+        status_msg = await update.message.reply_text(f"🔓 Key Accepted! Sending {count} files...\nPlease wait.")
         
-        for f in v["files"]:
-            # Handle both old format (string ID) and new format (dict with type)
-            if isinstance(f, dict):
-                fid = f['id']
-                ftype = f.get('type', 'document')
-            else:
-                fid = f
-                ftype = 'unknown'
+        for i, f in enumerate(v["files"]):
+            if isinstance(f, dict): fid, ftype = f['id'], f.get('type', 'document')
+            else: fid, ftype = f, 'unknown'
 
             try:
-                # Add DELAY to prevent Telegram FloodWait error on bulk sending
-                await asyncio.sleep(0.5) 
+                # Optimized Delay: Small delay prevents flood, but keeps it fast
+                await asyncio.sleep(0.05) 
                 
                 if ftype == 'video': msg = await update.message.reply_video(fid)
                 elif ftype == 'photo': msg = await update.message.reply_photo(fid)
                 elif ftype == 'animation': msg = await update.message.reply_animation(fid)
                 else: msg = await update.message.reply_document(fid) 
-            except:
-                msg = await update.message.reply_document(fid) 
-            
-            context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
+                
+                # Individual Auto-Delete Timer for each file
+                context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
+            except Exception as e:
+                # Fallback if specific type fails, try document
+                try: 
+                    msg = await update.message.reply_document(fid)
+                    context.job_queue.run_once(del_msg, 1800, data=msg.message_id, chat_id=update.effective_chat.id)
+                except: pass # Skip if file is totally invalid
+                
+        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=status_msg.message_id)
+        await update.message.reply_text("✅ All files sent! They will disappear in 30 mins.")
     else: await update.message.reply_text("❌ Wrong Key")
     return ConversationHandler.END
 
@@ -399,7 +403,6 @@ def main():
             MOV_ME: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.ALL) & ~filters.COMMAND, save_g_media)], 
             MOV_DE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_desc)], MOV_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_g_final)],
             A_V_FOLD: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_sub)], A_V_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_post)], A_V_POST: [MessageHandler((filters.PHOTO | filters.VIDEO | filters.Document.ALL) & ~filters.COMMAND, v_desc)], A_V_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, v_files_start)], 
-            # FIXED: Supports Bulk Upload & Type Storage
             A_V_FILES: [CommandHandler("done", v_collect), MessageHandler(filters.ALL & ~filters.COMMAND, v_collect)],
             AD_PHO_STATE: [MessageHandler((filters.PHOTO | filters.Regex("/skip")) & ~filters.COMMAND, ad_pho_fn)], AD_TXT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_txt_fn)], AD_LNK_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_lnk_fn)],
             U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), guide_show)], 
