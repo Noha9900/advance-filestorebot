@@ -39,6 +39,7 @@ col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"
 
 # --- SAFETY HELPER ---
 def get_file_info(message):
+    # Order matters: Animation > Video > Photo > Document
     if message.animation: return message.animation.file_id, "animation"
     if message.video: return message.video.file_id, "video"
     if message.photo: return message.photo[-1].file_id, "photo"
@@ -93,6 +94,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await update.callback_query.edit_message_text(w["text"], reply_markup=markup)
         except:
+            # Fallback
             await update.callback_query.message.delete()
             if w.get("photo"):
                 await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
@@ -311,7 +313,7 @@ async def ad_lnk_fn(update, context):
         return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
-# --- CONTENT DELIVERY (FIXED GUIDE DELIVERY) ---
+# --- CONTENT DELIVERY ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
@@ -358,19 +360,20 @@ async def vault_key_check(update, context):
     else: await update.message.reply_text("❌ Wrong Key")
     return ConversationHandler.END
 
+# --- FIXED GUIDE SHOW (Universal Fallback) ---
 async def guide_show(update, context):
     try:
         # 1. State Check
         view_type = context.user_data.get("view_type")
         if not view_type:
-            await update.message.reply_text("❌ Session expired. Click the buttons again.")
+            await update.message.reply_text("❌ Session expired. Click buttons again.")
             return ConversationHandler.END
 
         # 2. Input Validation
         try:
             idx = int(update.message.text) - 1
         except ValueError:
-            await update.message.reply_text("❌ Please send a valid number.")
+            await update.message.reply_text("❌ Send a valid number.")
             return U_GUIDE_SELECT
 
         # 3. Database Fetch
@@ -381,33 +384,47 @@ async def guide_show(update, context):
             item = items[idx]
             caption = f"⭐ <b>{item['name']}</b>\n\n{item['desc']}\n\n🔗 Watch: {item['link']}"
             mtype = item.get("media_type", "photo") 
+            fid = item["file"]
             
-            # 4. Robust Sending Logic (Try-Except Fallback Chain)
+            # 4. ROBUST SENDING (The Fix)
+            success = False
+            
+            # Attempt 1: Specific Type
             try:
-                if mtype == "video": 
-                    await update.message.reply_video(item["file"], caption=caption)
-                elif mtype == "animation": 
-                    await update.message.reply_animation(item["file"], caption=caption)
-                elif mtype == "document": 
-                    await update.message.reply_document(item["file"], caption=caption)
-                else: 
-                    await update.message.reply_photo(item["file"], caption=caption)
-            except Exception:
-                # If Telegram rejects type, force Video or Document
+                if mtype == "video": await update.message.reply_video(fid, caption=caption)
+                elif mtype == "animation": await update.message.reply_animation(fid, caption=caption)
+                elif mtype == "document": await update.message.reply_document(fid, caption=caption)
+                else: await update.message.reply_photo(fid, caption=caption)
+                success = True
+            except Exception as e:
+                logger.error(f"Attempt 1 failed: {e}")
+                
+            # Attempt 2: Force Video (if type mismatch)
+            if not success:
                 try:
-                    await update.message.reply_video(item["file"], caption=caption)
-                except:
-                    await update.message.reply_document(item["file"], caption=caption)
+                    await update.message.reply_video(fid, caption=caption)
+                    success = True
+                except: pass
+                
+            # Attempt 3: Force Document (Magic Bullet)
+            if not success:
+                try:
+                    await update.message.reply_document(fid, caption=caption)
+                    success = True
+                except: pass
             
-            # Cleanup "Processing" message
+            # Cleanup
             try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
             except: pass
             
+            if not success:
+                await update.message.reply_text("❌ Error: File is possibly deleted or invalid.")
         else: 
-            await update.message.reply_text(f"❌ Invalid Number. Choose 1-{len(items)}")
+            await update.message.reply_text(f"❌ Invalid Number. 1-{len(items)}")
+            
     except Exception as e:
-        logger.error(f"Guide Error: {e}")
-        await update.message.reply_text("❌ Error fetching content. Try again.")
+        logger.error(f"Critical Guide Error: {e}")
+        await update.message.reply_text("❌ System Error. Try again.")
     return U_GUIDE_SELECT
 
 # --- DELETE & MISC ---
