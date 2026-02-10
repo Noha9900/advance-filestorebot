@@ -1,6 +1,4 @@
-import os
-import asyncio
-import secrets
+import os, asyncio, secrets, logging
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -11,7 +9,7 @@ from telegram.ext import (
 )
 from openai import OpenAI
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 OPENAI_API_KEY = os.getenv("OPEN_AI_KEY")
@@ -19,151 +17,165 @@ PORT = int(os.getenv("PORT", "8080"))
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- DATABASE STRUCTURE ---
+# --- DB ---
 db = {
     "welcome": {"photo": None, "text": "Welcome to the Vault!"},
-    "adult": {"welcome_photo": None, "welcome_text": "Adult Zone", "channels": []},
-    "anime": [],
-    "movies": [],
-    "vault": {}, # structure: {folder_name: {subfolders: {videos: [], albums: []}, key: ""}}
-    "active_keys": {} 
+    "adult": {"photo": None, "text": "Adult Stream", "channels": []},
+    "anime": [], "movies": [], "vault": {}, "keys": []
 }
 
-# --- CONVERSATION STATES ---
-(A_WELCOME_TEXT, A_WELCOME_PHOTO, A_ANIME_NAME, A_ANIME_MEDIA, A_ANIME_DESC, A_ANIME_LINK,
- A_VAULT_NAME, A_VAULT_FILE, U_VAULT_KEY, U_GUIDE_SELECT) = range(10)
+# --- STATES ---
+(A_W_TEXT, A_W_PHOTO, A_NAME, A_MEDIA, A_DESC, A_LINK, V_KEY) = range(7)
 
-# --- AI FACILITY ---
+# --- AI ---
 async def ai_guide(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_msg = update.message.text
     try:
-        response = client.chat.completions.create(
+        res = client.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "system", "content": "You are an AI assistant for a Vault Bot. Guide users on how to enter keys or find content."},
-                      {"role": "user", "content": user_msg}]
+            messages=[{"role": "system", "content": "Explain the bot buttons and the 12-digit key system."},
+                      {"role": "user", "content": update.message.text}]
         )
-        await update.message.reply_text(f"🤖 AI Guide: {response.choices[0].message.content}")
+        await update.message.reply_text(f"🤖 {res.choices[0].message.content}")
     except:
-        await update.message.reply_text("🤖 I'm here to help! Use the menu buttons to navigate.")
+        await update.message.reply_text("🤖 I'm here to help! Use the buttons below.")
 
 # --- UTILS ---
-async def delete_msg(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await context.bot.delete_message(chat_id=context.job.chat_id, message_id=context.job.data)
+async def del_msg(context: ContextTypes.DEFAULT_TYPE):
+    try: await context.bot.delete_message(chat_id=context.job.chat_id, message_id=context.job.data)
     except: pass
 
-# --- USER INTERFACE ---
+# --- MAIN UI ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [
-        [InlineKeyboardButton("Welcome 🏠", callback_data="u_welcome"), InlineKeyboardButton("Adult Stream 🔥", callback_data="u_adult")],
+        [InlineKeyboardButton("Welcome 🏠", callback_data="u_w"), InlineKeyboardButton("Adult Stream 🔥", callback_data="u_a")],
         [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
-        [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_vault_folders")]
+        [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_v")]
     ]
-    text = "Main Menu"
+    text = "💠 **MAIN MENU** 💠\nChoose an option below:"
     if update.message:
-        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
-async def handle_user_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- BUTTON LOGIC ---
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    data = query.data
     await query.answer()
+
+    if data == "u_w":
+        w = db["welcome"]
+        if w["photo"]: m = await query.message.reply_photo(w["photo"], caption=w["text"])
+        else: m = await query.message.reply_text(w["text"])
+        context.job_queue.run_once(del_msg, 30, data=m.message_id, chat_id=query.message.chat_id)
     
-    if query.data == "u_welcome":
-        data = db["welcome"]
-        if data["photo"]:
-            msg = await query.message.reply_photo(photo=data["photo"], caption=data["text"])
-        else:
-            msg = await query.message.reply_text(data["text"])
-        context.job_queue.run_once(delete_msg, 30, data=msg.message_id, chat_id=query.message.chat_id)
+    elif data == "u_a":
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="main")]]
+        await query.edit_message_text(f"🔞 **{db['adult']['text']}**\nJoin our channels below:", reply_markup=InlineKeyboardMarkup(kb))
 
-    elif "u_list_" in query.data:
-        guide_type = query.data.split("_")[-1]
-        items = db[guide_type]
-        text = f"📖 **{guide_type.upper()} LIST**\nReply with the number to view:\n"
-        for i, item in enumerate(items, 1):
-            text += f"{i}. {item['name']}\n"
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main")]]))
-        context.user_data["viewing"] = guide_type
-        return U_GUIDE_SELECT
+    elif "u_list_" in data:
+        g_type = data.split("_")[-1]
+        items = db[g_type]
+        txt = f"📖 **{g_type.upper()} GUIDE**\n\n"
+        for i, item in enumerate(items, 1): txt += f"{i}. {item['name']}\n"
+        if not items: txt += "No entries found."
+        kb = [[InlineKeyboardButton("🔙 Back", callback_data="main")]]
+        await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
-async def show_guide_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    idx = int(update.message.text) - 1
-    guide_type = context.user_data.get("viewing")
-    if 0 <= idx < len(db[guide_type]):
-        item = db[guide_type][idx]
-        caption = f"📌 {item['name']}\n\n{item['desc']}\n\n🔗 Link: {item['link']}"
-        await update.message.reply_photo(photo=item['media'], caption=caption)
-    return ConversationHandler.END
+    elif data == "u_v":
+        await query.edit_message_text("🔐 **VAULT LOCKED**\nPlease enter the 12-digit key:")
+        return V_KEY
 
 # --- ADMIN PANEL ---
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     kb = [
-        [InlineKeyboardButton("Set Welcome", callback_data="adm_w"), InlineKeyboardButton("Add Anime", callback_data="adm_anime")],
-        [InlineKeyboardButton("Add Movie", callback_data="adm_movie"), InlineKeyboardButton("Create Vault Folder", callback_data="adm_vault")]
+        [InlineKeyboardButton("Set Welcome", callback_data="adm_w"), InlineKeyboardButton("Add Anime", callback_data="adm_ani")],
+        [InlineKeyboardButton("Add Movie", callback_data="adm_mov"), InlineKeyboardButton("Gen Key", callback_data="adm_gen")]
     ]
-    await update.message.reply_text("🛠 Admin Control Panel", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text("🛠 **ADMIN PANEL**", reply_markup=InlineKeyboardMarkup(kb))
 
-async def start_anime_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    context.user_data["mode"] = "anime" if "anime" in update.callback_query.data else "movies"
-    await update.callback_query.edit_message_text("Send the Name:")
-    return A_ANIME_NAME
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "adm_w":
+        await query.edit_message_text("Send Welcome Text:")
+        return A_W_TEXT
+    elif query.data in ["adm_ani", "adm_mov"]:
+        context.user_data["type"] = "anime" if "ani" in query.data else "movies"
+        await query.edit_message_text("Send Name:")
+        return A_NAME
+    elif query.data == "adm_gen":
+        key = "".join([str(secrets.randbelow(10)) for _ in range(12)])
+        db["keys"].append(key)
+        await query.edit_message_text(f"🗝 **Generated Key:** `{key}`\nCopy and give to users.")
+        return ConversationHandler.END
 
-async def save_anime_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- ADMIN CONVERSATION STEPS ---
+async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["temp"] = {"name": update.message.text}
-    await update.message.reply_text("Now send Video or Photo:")
-    return A_ANIME_MEDIA
+    await update.message.reply_text("Send Photo/Video:")
+    return A_MEDIA
 
-async def save_anime_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["temp"]["media"] = (update.message.photo[-1].file_id if update.message.photo else update.message.video.file_id)
+async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["temp"]["file"] = update.message.photo[-1].file_id if update.message.photo else update.message.video.file_id
     await update.message.reply_text("Send Description:")
-    return A_ANIME_DESC
+    return A_DESC
 
-async def save_anime_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["temp"]["desc"] = update.message.text
     await update.message.reply_text("Send Link:")
-    return A_ANIME_LINK
+    return A_LINK
 
-async def save_anime_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def save_final(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["temp"]["link"] = update.message.text
-    db[context.user_data["mode"]].append(context.user_data["temp"])
-    await update.message.reply_text("✅ Entry Added!")
+    db[context.user_data["type"]].append(context.user_data["temp"])
+    await update.message.reply_text("✅ Added Successfully!")
     return ConversationHandler.END
 
-# --- SERVER FOR RENDER ---
-server = Flask(__name__)
-@server.route('/')
-def h(): return "OK"
+# --- VAULT ACCESS ---
+async def check_v_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text in db["keys"]:
+        m = await update.message.reply_text("🔓 **Vault Unlocked!**\nAccessing files... (Disappearing in 30m)")
+        context.job_queue.run_once(del_msg, 1800, data=m.message_id, chat_id=update.effective_chat.id)
+    else:
+        await update.message.reply_text("❌ Invalid Key.")
+    return ConversationHandler.END
+
+# --- RENDER SERVER ---
+app = Flask(__name__)
+@app.route('/')
+def h(): return "Bot Running"
 
 def main():
-    app = Application.builder().token(TOKEN).build()
-    
-    # Combined Conversation Handler
+    application = Application.builder().token(TOKEN).build()
+
+    # The Logic Engine: Conversation Handler
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("admin", admin_panel),
-            CallbackQueryHandler(start_anime_add, pattern="adm_(anime|movie)"),
-            CallbackQueryHandler(handle_user_buttons, pattern="u_.*")
+            CallbackQueryHandler(admin_callback, pattern="^adm_"),
+            CallbackQueryHandler(handle_buttons, pattern="^u_")
         ],
         states={
-            A_ANIME_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_anime_name)],
-            A_ANIME_MEDIA: [MessageHandler((filters.PHOTO | filters.VIDEO) & ~filters.COMMAND, save_anime_media)],
-            A_ANIME_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_anime_desc)],
-            A_ANIME_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_anime_final)],
-            U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\d+$'), show_guide_item)]
+            A_W_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: A_W_PHOTO)],
+            A_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_name)],
+            A_MEDIA: [MessageHandler((filters.PHOTO | filters.VIDEO), save_media)],
+            A_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_desc)],
+            A_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_final)],
+            V_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, check_v_key)]
         },
-        fallbacks=[CommandHandler("start", start)]
+        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="main")]
     )
 
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_guide))
-    app.add_handler(CallbackQueryHandler(start, pattern="main"))
+    application.add_handler(conv)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(start, pattern="main"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, ai_guide))
 
-    Thread(target=lambda: server.run(host='0.0.0.0', port=PORT)).start()
-    app.run_polling()
+    Thread(target=lambda: app.run(host='0.0.0.0', port=PORT)).start()
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
