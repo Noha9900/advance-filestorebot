@@ -75,30 +75,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
         context.job_queue.run_once(del_msg, 60, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
-        # Check if we need to swap media back to welcome photo
+        # Smart Media Swap Logic
         try:
             if w.get("photo"):
                 if update.callback_query.message.photo:
-                    # If it's already a photo, swap it (Smoother)
                     await update.callback_query.edit_message_media(
                         media=InputMediaPhoto(media=w["photo"], caption=w["text"]),
                         reply_markup=markup
                     )
                 else:
-                    # Text to Photo
                     await update.callback_query.message.delete()
                     await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
             else:
-                # Text only
                 if update.callback_query.message.photo:
                     await update.callback_query.message.delete()
                     await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
                 else:
                     await update.callback_query.edit_message_text(w["text"], reply_markup=markup)
         except:
-            # Absolute fallback
-            try: await update.callback_query.message.delete()
-            except: pass
+            await update.callback_query.message.delete()
             if w.get("photo"):
                 await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
             else:
@@ -117,7 +112,7 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "main": return await start(update, context)
 
-    # --- ADULT STREAM (FIXED MEDIA SWAP) ---
+    # --- ADULT STREAM ---
     if query.data.startswith("u_ad"):
         page = int(query.data.split("_")[-1]) if "_" in query.data else 0
         _, ad = await get_settings()
@@ -138,36 +133,25 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         markup = InlineKeyboardMarkup(kb)
         
-        # LOGIC FIX: Explicitly swap media using InputMediaPhoto
         try:
             if ad.get("photo"):
                 if query.message.photo:
-                    # Photo -> New Photo (Swap)
-                    await query.edit_message_media(
-                        media=InputMediaPhoto(media=ad["photo"], caption=ad["text"]),
-                        reply_markup=markup
-                    )
+                    await query.edit_message_media(media=InputMediaPhoto(media=ad["photo"], caption=ad["text"]), reply_markup=markup)
                 else:
-                    # Text -> Photo (Delete & Send)
                     await query.message.delete()
                     await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=markup)
             else:
-                # Target is Text
                 if query.message.photo:
-                    # Photo -> Text (Delete & Send)
                     await query.message.delete()
                     await query.message.reply_text(ad["text"], reply_markup=markup)
                 else:
-                    # Text -> Text (Edit)
                     await query.edit_message_text(ad["text"], reply_markup=markup)
-        except Exception as e:
-            # Fallback for any API errors
+        except Exception:
             await query.message.delete()
             if ad.get("photo"):
                 await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=markup)
             else:
                 await query.message.reply_text(ad["text"], reply_markup=markup)
-                
         return ConversationHandler.END
 
     # --- LISTS (ANIME/MOVIE) ---
@@ -318,7 +302,6 @@ async def ad_lnk_fn(update, context):
     try:
         parts = update.message.text.split("|")
         await col_settings.update_one({"type": "adult"}, {"$set": {"photo": context.user_data["ad_tmp"]["photo"], "text": context.user_data["ad_tmp"]["text"]}, "$push": {"channels": {"name": parts[0].strip(), "link": parts[1].strip()}}}, upsert=True)
-        # SHOW PREVIEW TO ADMIN
         await update.message.reply_text("✅ <b>Saved! Preview:</b>")
         if context.user_data["ad_tmp"]["photo"]:
             await update.message.reply_photo(context.user_data["ad_tmp"]["photo"], caption=context.user_data["ad_tmp"]["text"])
@@ -328,7 +311,7 @@ async def ad_lnk_fn(update, context):
         return AD_LNK_STATE
     except: await update.message.reply_text("Err: Name | Link"); return AD_LNK_STATE
 
-# --- CONTENT DELIVERY ---
+# --- CONTENT DELIVERY (FIXED GUIDE DELIVERY) ---
 async def vault_select_sub(update, context):
     try:
         idx = int(update.message.text) - 1
@@ -377,25 +360,54 @@ async def vault_key_check(update, context):
 
 async def guide_show(update, context):
     try:
-        idx = int(update.message.text) - 1
-        items = await col_guides.find({"type": context.user_data.get("view_type")}).sort("_id", 1).to_list(100)
+        # 1. State Check
+        view_type = context.user_data.get("view_type")
+        if not view_type:
+            await update.message.reply_text("❌ Session expired. Click the buttons again.")
+            return ConversationHandler.END
+
+        # 2. Input Validation
+        try:
+            idx = int(update.message.text) - 1
+        except ValueError:
+            await update.message.reply_text("❌ Please send a valid number.")
+            return U_GUIDE_SELECT
+
+        # 3. Database Fetch
+        msg = await update.message.reply_text("⏳ Processing...")
+        items = await col_guides.find({"type": view_type}).sort("_id", 1).to_list(100)
         
         if 0 <= idx < len(items):
             item = items[idx]
             caption = f"⭐ <b>{item['name']}</b>\n\n{item['desc']}\n\n🔗 Watch: {item['link']}"
             mtype = item.get("media_type", "photo") 
             
+            # 4. Robust Sending Logic (Try-Except Fallback Chain)
             try:
-                if mtype == "video": await update.message.reply_video(item["file"], caption=caption)
-                elif mtype == "animation": await update.message.reply_animation(item["file"], caption=caption)
-                elif mtype == "document": await update.message.reply_document(item["file"], caption=caption)
-                else: await update.message.reply_photo(item["file"], caption=caption)
-            except:
-                await update.message.reply_document(item["file"], caption=caption)
+                if mtype == "video": 
+                    await update.message.reply_video(item["file"], caption=caption)
+                elif mtype == "animation": 
+                    await update.message.reply_animation(item["file"], caption=caption)
+                elif mtype == "document": 
+                    await update.message.reply_document(item["file"], caption=caption)
+                else: 
+                    await update.message.reply_photo(item["file"], caption=caption)
+            except Exception:
+                # If Telegram rejects type, force Video or Document
+                try:
+                    await update.message.reply_video(item["file"], caption=caption)
+                except:
+                    await update.message.reply_document(item["file"], caption=caption)
+            
+            # Cleanup "Processing" message
+            try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+            except: pass
+            
         else: 
-            await update.message.reply_text(f"❌ Invalid Number. 1-{len(items)}")
-    except ValueError: 
-        await update.message.reply_text("❌ Send a Number.")
+            await update.message.reply_text(f"❌ Invalid Number. Choose 1-{len(items)}")
+    except Exception as e:
+        logger.error(f"Guide Error: {e}")
+        await update.message.reply_text("❌ Error fetching content. Try again.")
     return U_GUIDE_SELECT
 
 # --- DELETE & MISC ---
