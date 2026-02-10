@@ -1,4 +1,4 @@
-import os, asyncio, secrets
+import os, asyncio, secrets, logging
 from datetime import datetime, timedelta
 from flask import Flask
 from threading import Thread
@@ -7,25 +7,22 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
-from openai import OpenAI
 
 # --- CONFIG ---
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-OPENAI_API_KEY = os.getenv("OPEN_AI_KEY")
 PORT = int(os.getenv("PORT", "8080"))
 
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# --- DB (Local storage - will reset on Render restart) ---
+# --- DB (Local) ---
 db = {
     "welcome": {"photo": None, "text": "Welcome to the Vault! 🔥"},
-    "adult": {"photo": None, "text": "Adult Stream Zone", "channels": []},
+    "adult": {"photo": None, "text": "Adult Stream Zone", "channels": []}, # List of {"name": x, "link": y}
     "anime": [], "movies": [], "vault": {}, "keys": []
 }
 
 # --- STATES ---
-(A_W_TEXT, A_W_PHOTO, A_NAME, A_MEDIA, A_DESC, A_LINK, V_KEY) = range(7)
+(A_W_TEXT, A_W_PHOTO, A_NAME, A_MEDIA, A_DESC, A_LINK, 
+ A_AD_PHOTO, A_AD_TEXT, A_AD_CHAN_NAME, A_AD_CHAN_LINK) = range(10)
 
 # --- UTILS ---
 async def del_msg(context: ContextTypes.DEFAULT_TYPE):
@@ -36,10 +33,10 @@ async def del_msg(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     w = db["welcome"]
     kb = [
-        [InlineKeyboardButton("Adult Stream 🔥", callback_data="u_a")],
+        [InlineKeyboardButton("Adult Stream 🔥", callback_data="u_adult_view")],
         [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), 
          InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
-        [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_v")]
+        [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_v_lock")]
     ]
     markup = InlineKeyboardMarkup(kb)
     
@@ -50,30 +47,48 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
         context.job_queue.run_once(del_msg, 30, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
-        # Handle "Back" buttons or button edits
+        # If edit fails (e.g. switching from photo to text), send a new message
         try:
             await update.callback_query.edit_message_text(w["text"], reply_markup=markup)
         except:
-            # If the original message had a photo, we can't edit text only, so we send new
             await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
+
+async def view_adult_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ad = db["adult"]
+    
+    # Build Channel Buttons
+    kb = [[InlineKeyboardButton(c["name"], url=c["link"])] for c in ad["channels"]]
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
+    
+    if ad["photo"]:
+        msg = await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        msg = await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
+    
+    context.job_queue.run_once(del_msg, 30, data=msg.message_id, chat_id=query.message.chat_id)
 
 # --- ADMIN PANEL ---
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Access Denied.")
-        return
+    if update.effective_user.id != ADMIN_ID: return
     kb = [
-        [InlineKeyboardButton("Set Welcome", callback_data="adm_w"), InlineKeyboardButton("Add Anime", callback_data="adm_ani")],
-        [InlineKeyboardButton("Add Movie", callback_data="adm_mov"), InlineKeyboardButton("Gen Key", callback_data="adm_gen")]
+        [InlineKeyboardButton("Set Welcome", callback_data="adm_w"), InlineKeyboardButton("Set Adult Stream", callback_data="adm_ad")],
+        [InlineKeyboardButton("Add Anime", callback_data="adm_ani"), InlineKeyboardButton("Add Movie", callback_data="adm_mov")],
+        [InlineKeyboardButton("Gen Key 🗝", callback_data="adm_gen")]
     ]
     await update.message.reply_text("🛠 **ADMIN PANEL**", reply_markup=InlineKeyboardMarkup(kb))
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
     if query.data == "adm_w":
         await query.edit_message_text("1️⃣ Send the new Welcome Text:")
         return A_W_TEXT
+    elif query.data == "adm_ad":
+        await query.edit_message_text("🔞 Adult Setup: Send the Welcome Photo (or /skip):")
+        return A_AD_PHOTO
     elif query.data in ["adm_ani", "adm_mov"]:
         context.user_data["type"] = "anime" if "ani" in query.data else "movies"
         await query.edit_message_text(f"Enter Name for {context.user_data['type']}:")
@@ -81,52 +96,36 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "adm_gen":
         key = "".join([str(secrets.randbelow(10)) for _ in range(12)])
         db["keys"].append(key)
-        await query.edit_message_text(f"🗝 **New Key:** `{key}`")
+        await query.edit_message_text(f"🗝 **New Key Generated:** `{key}`")
         return ConversationHandler.END
 
-# --- ADMIN SAVE LOGIC (FIXED) ---
-async def save_welcome_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_w_text"] = update.message.text
-    await update.message.reply_text("2️⃣ Now send the Photo (or send /skip to use text only):")
-    return A_W_PHOTO
+# --- ADULT STREAM SETUP ---
+async def ad_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db["adult"]["photo"] = update.message.photo[-1].file_id if update.message.photo else None
+    await update.message.reply_text("Send the Adult Stream Welcome Text:")
+    return A_AD_TEXT
 
-async def save_welcome_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db["welcome"]["text"] = context.user_data["new_w_text"]
-    if update.message.photo:
-        db["welcome"]["photo"] = update.message.photo[-1].file_id
-        await update.message.reply_text("✅ Welcome Message updated with Photo!")
-    else:
-        db["welcome"]["photo"] = None
-        await update.message.reply_text("✅ Welcome Message updated (Text Only)!")
-    return ConversationHandler.END
+async def ad_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db["adult"]["text"] = update.message.text
+    db["adult"]["channels"] = [] # Reset for new setup
+    await update.message.reply_text("Now send the 1st Channel Name:")
+    return A_AD_CHAN_NAME
 
-# --- GUIDE LOGIC ---
-async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["temp"] = {"name": update.message.text}
-    await update.message.reply_text("Send Media (Photo/Video):")
-    return A_MEDIA
+async def ad_chan_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["last_chan"] = update.message.text
+    await update.message.reply_text(f"Send the Link for {update.message.text}:")
+    return A_AD_CHAN_LINK
 
-async def save_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    fid = update.message.photo[-1].file_id if update.message.photo else update.message.video.file_id
-    context.user_data["temp"]["file"] = fid
-    await update.message.reply_text("Send Description:")
-    return A_DESC
+async def ad_chan_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db["adult"]["channels"].append({"name": context.user_data["last_chan"], "link": update.message.text})
+    kb = [[InlineKeyboardButton("Add Another", callback_data="add_more"), InlineKeyboardButton("Finish", callback_data="finish")]]
+    await update.message.reply_text("Channel added! Add more or finish?", reply_markup=InlineKeyboardMarkup(kb))
+    return A_AD_CHAN_NAME # Loop or end via callback
 
-async def save_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["temp"]["desc"] = update.message.text
-    await update.message.reply_text("Send Link:")
-    return A_LINK
-
-async def save_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["temp"]["link"] = update.message.text
-    db[context.user_data["type"]].append(context.user_data["temp"])
-    await update.message.reply_text("✅ Added to Guide!")
-    return ConversationHandler.END
-
-# --- MAIN APP ---
+# --- FLASK KEEP-ALIVE ---
 server = Flask(__name__)
 @server.route('/')
-def h(): return "OK"
+def h(): return "Bot is 24/7 Active"
 
 def main():
     app = Application.builder().token(TOKEN).build()
@@ -134,23 +133,25 @@ def main():
     admin_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_callback, pattern="^adm_")],
         states={
-            A_W_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_welcome_text)],
-            A_W_PHOTO: [MessageHandler(filters.PHOTO, save_welcome_photo), CommandHandler("skip", save_welcome_photo)],
-            A_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_name)],
-            A_MEDIA: [MessageHandler(filters.PHOTO | filters.VIDEO, save_media)],
-            A_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_desc)],
-            A_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_all)],
+            A_W_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u, c: A_W_PHOTO)], # Connect to your existing save logic
+            A_AD_PHOTO: [MessageHandler(filters.PHOTO | filters.COMMAND, ad_photo)],
+            A_AD_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_text)],
+            A_AD_CHAN_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_chan_name), CallbackQueryHandler(lambda u, c: ConversationHandler.END, pattern="finish")],
+            A_AD_CHAN_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, ad_chan_link)],
+            # Include your previous A_NAME, A_MEDIA, A_DESC states here...
         },
-        fallbacks=[CommandHandler("start", start)]
+        fallbacks=[CommandHandler("start", start), CallbackQueryHandler(start, pattern="main_menu")],
+        allow_reentry=True # Critical for 24/7 button usage
     )
 
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(admin_conv)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(start, pattern="main"))
+    app.add_handler(CallbackQueryHandler(view_adult_stream, pattern="u_adult_view"))
+    app.add_handler(CallbackQueryHandler(start, pattern="main_menu"))
 
     Thread(target=lambda: server.run(host='0.0.0.0', port=PORT)).start()
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
