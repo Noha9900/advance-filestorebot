@@ -1,4 +1,4 @@
-import os, asyncio, secrets, logging
+import os, asyncio, secrets, logging, html
 from datetime import datetime
 from flask import Flask
 from threading import Thread
@@ -39,7 +39,6 @@ col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"
 
 # --- SAFETY HELPER ---
 def get_file_info(message):
-    # Order matters: Animation > Video > Photo > Document
     if message.animation: return message.animation.file_id, "animation"
     if message.video: return message.video.file_id, "video"
     if message.photo: return message.photo[-1].file_id, "photo"
@@ -76,7 +75,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
         context.job_queue.run_once(del_msg, 60, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
-        # Smart Media Swap Logic
         try:
             if w.get("photo"):
                 if update.callback_query.message.photo:
@@ -95,7 +93,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.callback_query.edit_message_text(w["text"], reply_markup=markup)
         except:
             # Fallback
-            await update.callback_query.message.delete()
+            try: await update.callback_query.message.delete()
+            except: pass
             if w.get("photo"):
                 await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
             else:
@@ -360,7 +359,7 @@ async def vault_key_check(update, context):
     else: await update.message.reply_text("❌ Wrong Key")
     return ConversationHandler.END
 
-# --- FIXED GUIDE SHOW (Universal Fallback) ---
+# --- FIXED GUIDE SHOW (Robust & HTML Safe) ---
 async def guide_show(update, context):
     try:
         # 1. State Check
@@ -382,11 +381,18 @@ async def guide_show(update, context):
         
         if 0 <= idx < len(items):
             item = items[idx]
-            caption = f"⭐ <b>{item['name']}</b>\n\n{item['desc']}\n\n🔗 Watch: {item['link']}"
+            
+            # --- CRITICAL FIX: Sanitize Text to prevent HTML errors ---
+            safe_name = html.escape(item['name'])
+            safe_desc = html.escape(item['desc'])
+            
+            # Limit description to prevent "Message too long" errors
+            if len(safe_desc) > 800: safe_desc = safe_desc[:800] + "..."
+            
+            caption = f"⭐ <b>{safe_name}</b>\n\n{safe_desc}\n\n🔗 Watch: {item['link']}"
             mtype = item.get("media_type", "photo") 
             fid = item["file"]
             
-            # 4. ROBUST SENDING (The Fix)
             success = False
             
             # Attempt 1: Specific Type
@@ -399,14 +405,14 @@ async def guide_show(update, context):
             except Exception as e:
                 logger.error(f"Attempt 1 failed: {e}")
                 
-            # Attempt 2: Force Video (if type mismatch)
+            # Attempt 2: Force Video (Common mismatch fix)
             if not success:
                 try:
                     await update.message.reply_video(fid, caption=caption)
                     success = True
                 except: pass
                 
-            # Attempt 3: Force Document (Magic Bullet)
+            # Attempt 3: Force Document (Ultimate Fallback)
             if not success:
                 try:
                     await update.message.reply_document(fid, caption=caption)
