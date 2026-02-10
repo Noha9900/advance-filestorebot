@@ -2,12 +2,12 @@ import os, asyncio, secrets, logging
 from datetime import datetime
 from flask import Flask
 from threading import Thread
-import certifi # SSL Certificate verification
+import certifi 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, 
-    MessageHandler, filters, ContextTypes, ConversationHandler, Defaults
+    MessageHandler, filters, ContextTypes, ConversationHandler, Defaults, PicklePersistence
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
@@ -22,24 +22,22 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MONGO_URL = os.getenv("MONGO_URL")
 PORT = int(os.getenv("PORT", "8080"))
 
-# Production DB Connection (Optimized for Cloud)
+# Production DB Connection
 client = AsyncIOMotorClient(
     MONGO_URL, 
     maxPoolSize=10, 
     minPoolSize=1, 
     serverSelectionTimeoutMS=5000,
-    connectTimeoutMS=10000,
     tlsCAFile=certifi.where()
 )
 db = client["vault_bot_db"]
 col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"]
 
-# Conversation States
 (W_TXT, W_PHO, AD_PHO_STATE, AD_TXT_STATE, AD_LNK_STATE, ANI_NA, ANI_ME, ANI_DE, ANI_LI, 
  MOV_NA, MOV_ME, MOV_DE, MOV_LI, A_V_FOLD, A_V_SUB, A_V_POST, A_V_DESC, 
  A_V_FILES, V_KEY_INPUT, U_GUIDE_SELECT, U_V_SUB_SELECT, ADM_DEL_SELECT) = range(22)
 
-# --- SAFETY HELPER (Added Animation Support) ---
+# --- SAFETY HELPER ---
 def get_file_info(message):
     if message.photo: return message.photo[-1].file_id, "photo"
     if message.video: return message.video.file_id, "video"
@@ -57,13 +55,13 @@ async def del_msg(context: ContextTypes.DEFAULT_TYPE):
     except: pass
 
 async def get_settings():
-    w = await col_settings.find_one({"type": "welcome"}) or {"text": "Welcome! Bot is ready.", "photo": None}
-    a = await col_settings.find_one({"type": "adult"}) or {"text": "Adult Zone Restricted", "photo": None, "channels": []}
+    w = await col_settings.find_one({"type": "welcome"}) or {"text": "Welcome!", "photo": None}
+    a = await col_settings.find_one({"type": "adult"}) or {"text": "Adult Zone", "photo": None, "channels": []}
     return w, a
 
 # --- USER SIDE ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear() # Reset state
+    context.user_data.clear() 
     w, _ = await get_settings()
     kb = [[InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad")],
           [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
@@ -75,10 +73,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = await update.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
         else:
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
-        # Auto-delete welcome message after 1 min
         context.job_queue.run_once(del_msg, 60, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
-        # Handle "Back" navigation cleanly
         try: await update.callback_query.message.delete()
         except: pass
         if w.get("photo"):
@@ -89,7 +85,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    await update.message.reply_text("❌ Operation Cancelled. Type /start.")
+    await update.message.reply_text("❌ Cancelled. Type /start.")
     return ConversationHandler.END
 
 async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,7 +104,7 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.delete()
             await query.message.reply_photo(ad["photo"], caption=ad["text"], reply_markup=InlineKeyboardMarkup(kb))
         else:
-            if query.message.photo: # If switching media types, delete and resend
+            if query.message.photo:
                 await query.message.delete()
                 await query.message.reply_text(ad["text"], reply_markup=InlineKeyboardMarkup(kb))
             else:
@@ -350,6 +346,11 @@ async def error_handler(update, context): logger.error(f"Error {context.error}")
 def main():
     # Set defaults to HTML to safely handle bold text and links
     defaults = Defaults(parse_mode=ParseMode.HTML)
+    
+    # Enable PicklePersistence to save conversation state on restart (Optional but recommended)
+    # persistence = PicklePersistence(filepath='bot_data') 
+    # app = Application.builder().token(TOKEN).defaults(defaults).persistence(persistence).build()
+    
     app = Application.builder().token(TOKEN).defaults(defaults).build()
     
     async def init(): await col_vaults.create_index("key", unique=True)
