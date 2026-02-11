@@ -74,33 +74,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     markup = InlineKeyboardMarkup(kb)
     
+    # Message / Photo Handler
     if update.message:
         if w.get("photo"):
             msg = await update.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
         else:
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
+        # Delete start message after 60s
         context.job_queue.run_once(del_msg, 60, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
+        # Callback Handler (Back Button Logic)
+        query = update.callback_query
         try:
             if w.get("photo"):
-                if update.callback_query.message.photo:
-                    await update.callback_query.edit_message_media(media=InputMediaPhoto(media=w["photo"], caption=w["text"]), reply_markup=markup)
+                if query.message.photo:
+                    await query.edit_message_media(media=InputMediaPhoto(media=w["photo"], caption=w["text"]), reply_markup=markup)
                 else:
-                    await update.callback_query.message.delete()
-                    await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
+                    await query.message.delete()
+                    await query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
             else:
-                if update.callback_query.message.photo:
-                    await update.callback_query.message.delete()
-                    await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
+                if query.message.photo:
+                    await query.message.delete()
+                    await query.message.reply_text(w["text"], reply_markup=markup)
                 else:
-                    await update.callback_query.edit_message_text(w["text"], reply_markup=markup)
+                    await query.edit_message_text(w["text"], reply_markup=markup)
         except:
-            try: await update.callback_query.message.delete()
+            # Absolute Fail-safe
+            try: await query.message.delete()
             except: pass
-            if w.get("photo"):
-                await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
-            else:
-                await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
+            if w.get("photo"): await query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
+            else: await query.message.reply_text(w["text"], reply_markup=markup)
+
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -108,6 +112,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled. Type /start.")
     return ConversationHandler.END
 
+# --- MAIN ROUTER ---
 async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -117,14 +122,17 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- UPDATES ---
     if query.data == "u_updates":
         _, _, u = await get_settings()
-        txt = f"📢 <b>UPDATES</b>\n\n{html.escape(u.get('desc', ''))}\n\n"
+        txt = f"📢 <b>UPDATES</b>\n\n{html.escape(u.get('desc', 'Check here for updates!'))}\n\n"
+        
         if u.get('links'):
             txt += "👇 <b>Join Here:</b>\n"
             for link in u['links']:
                 txt += f"• {html.escape(link.get('name', 'Channel'))} - <a href='{link.get('url', '')}'><b>Click Me</b></a>\n"
         else:
             txt += "No updates yet."
+
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="main")]]
+        
         if query.message.photo:
             await query.message.delete()
             await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
@@ -148,6 +156,7 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav: kb.append(nav)
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         markup = InlineKeyboardMarkup(kb)
+        
         try:
             if ad.get("photo"):
                 if query.message.photo:
@@ -175,10 +184,10 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         LIMIT = 50
         skip = page * LIMIT
         
+        # Determine Search or Normal
         search_query = context.user_data.get("search_query")
         
         if search_query:
-            # Fix: Regex needs to be safe
             regex_pattern = re.escape(search_query)
             db_query = {"type": g_type, "name": {"$regex": regex_pattern, "$options": "i"}}
             header = f"🔍 <b>SEARCH: {html.escape(search_query)}</b>\n\n"
@@ -194,8 +203,7 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             txt = header + "Reply with <b>Number</b> to watch:\n\n"
             for i, item in enumerate(items):
-                # Search results are numbered 1-N locally on the page to prevent confusion
-                # Normal lists use Global Numbering
+                # Search = Local Numbering (1,2,3), Normal = Global (51,52,53)
                 if search_query:
                     display_num = i + 1 
                 else:
@@ -212,8 +220,9 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         
         context.user_data["view_type"] = g_type
-        # If normal list navigation, clear search query to avoid getting stuck in search mode
-        if "search_query" in context.user_data and not search_query:
+        
+        # Clear search query if we navigated back to normal list via button
+        if not query.data.startswith("list_") and "search_query" in context.user_data:
              del context.user_data["search_query"]
 
         try:
@@ -230,7 +239,10 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("search_"):
         g_type = query.data.split("_")[1]
         context.user_data["search_type"] = g_type
-        await query.edit_message_text(f"🔍 <b>Search {g_type.upper()}</b>\n\nSend the name you are looking for:")
+        # Clear previous search query to start fresh
+        if "search_query" in context.user_data: del context.user_data["search_query"]
+        
+        await query.edit_message_text(f"🔍 <b>Search {g_type.upper()}</b>\n\nSend the name you are looking for:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main")]]))
         return SEARCH_STATE
 
     # --- VAULT FOLDERS ---
@@ -269,11 +281,10 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_query = {"type": g_type, "name": {"$regex": regex_pattern, "$options": "i"}}
     
     items = await col_guides.find(db_query).sort("_id", 1).limit(LIMIT).to_list(LIMIT)
-    total_count = await col_guides.count_documents(db_query)
     
     txt = f"🔍 <b>RESULTS FOR: '{html.escape(query_text)}'</b>\n\n"
     if not items:
-        txt += "❌ No matches found."
+        txt += "❌ No matches found.\nTry a simpler name."
         kb = [[InlineKeyboardButton("🔙 Back to List", callback_data=f"list_{g_type}_0")]]
     else:
         txt += "Reply with the <b>Number</b> to watch:\n\n"
@@ -281,10 +292,7 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # In Search, numbering is 1-N locally
             txt += f"<b>{i+1}.</b> {html.escape(item['name'])}\n"
             
-        kb = []
-        if total_count > LIMIT:
-             kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"list_{g_type}_1")]) # Actually handled by list logic, but good for UI
-        kb.append([InlineKeyboardButton("🔙 Back to List", callback_data=f"list_{g_type}_0")])
+        kb = [[InlineKeyboardButton("🔙 Back to List", callback_data=f"list_{g_type}_0")]]
 
     await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
     return U_GUIDE_SELECT
@@ -309,7 +317,6 @@ async def admin_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "a_mov": context.user_data["p"]="movies"; await query.edit_message_text("Movie Name:"); return MOV_NA
     if query.data == "a_v": await query.edit_message_text("📂 Folder Name:"); return A_V_FOLD
     if query.data == "a_del": return await admin_del_menu(update, context)
-    
     if query.data == "a_upd": 
         kb = [[InlineKeyboardButton("Set Description", callback_data="upd_desc")],
               [InlineKeyboardButton("Add Channel Link", callback_data="upd_add")],
@@ -481,9 +488,9 @@ async def vault_select_sub(update, context):
             item = items[idx]
             context.user_data["target_v"] = item["_id"]
             if item.get("poster"):
-                await update.message.reply_photo(item["poster"], caption=f"📁 <b>{item['sub_name']}</b>\n\n{item['desc']}\n\n🔐 <b>Enter Key:</b>")
+                await update.message.reply_photo(item["poster"], caption=f"📁 <b>{item['sub_name']}</b>\n\n{item['desc']}\n\n🔐 <b>Enter Key:</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="u_vault_folders")]]))
             else:
-                await update.message.reply_text(f"📁 <b>{item['sub_name']}</b>\n\n{item['desc']}\n\n🔐 <b>Enter Key:</b>")
+                await update.message.reply_text(f"📁 <b>{item['sub_name']}</b>\n\n{item['desc']}\n\n🔐 <b>Enter Key:</b>", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="u_vault_folders")]]))
             return V_KEY_INPUT
         else: await update.message.reply_text(f"❌ Invalid Number. 1-{len(items)}")
     except ValueError: await update.message.reply_text("❌ Send a Number.")
@@ -514,12 +521,12 @@ async def vault_key_check(update, context):
     else: await update.message.reply_text("❌ Wrong Key")
     return ConversationHandler.END
 
-# --- GUIDE SHOW (ROBUST + FIX) ---
+# --- GUIDE SHOW (BUG FIXED) ---
 async def guide_show(update, context):
     try:
         view_type = context.user_data.get("view_type")
         if not view_type:
-            await update.message.reply_text("❌ Session expired.")
+            await update.message.reply_text("❌ Session expired. Click buttons again.")
             return ConversationHandler.END
 
         try:
@@ -535,7 +542,6 @@ async def guide_show(update, context):
                 # Normal list: Get global item
                 target_idx = user_input - 1
                 items = await col_guides.find({"type": view_type}).sort("_id", 1).skip(target_idx).limit(1).to_list(1)
-                # Reset target_idx because 'items' now only has 1 element
                 target_idx = 0 
 
         except ValueError:
@@ -547,7 +553,7 @@ async def guide_show(update, context):
         if items and 0 <= target_idx < len(items):
             item = items[target_idx]
             
-            # SAFE HTML & MISSING KEY HANDLING
+            # --- SAFE DATA EXTRACTION ---
             safe_name = html.escape(item.get('name', 'Unknown'))
             safe_desc = html.escape(item.get('desc', ''))
             chan_name = html.escape(item.get('chan_name', 'Channel'))
@@ -567,7 +573,7 @@ async def guide_show(update, context):
             success = False
             sent_msg = None
             
-            # TRY ALL METHODS
+            # --- SENDING LOGIC (NO ERROR POPUP ON SUCCESS) ---
             try:
                 if mtype == "video": sent_msg = await update.message.reply_video(fid, caption=caption)
                 elif mtype == "animation": sent_msg = await update.message.reply_animation(fid, caption=caption)
@@ -575,12 +581,10 @@ async def guide_show(update, context):
                 else: sent_msg = await update.message.reply_photo(fid, caption=caption)
                 success = True
             except Exception:
-                # Fallback to Video
                 try:
                     sent_msg = await update.message.reply_video(fid, caption=caption)
                     success = True
                 except:
-                    # Fallback to Document (Final Resort)
                     try:
                         sent_msg = await update.message.reply_document(fid, caption=caption)
                         success = True
@@ -590,9 +594,11 @@ async def guide_show(update, context):
             except: pass
             
             if success and sent_msg:
+                # SUCCESS: Schedule delete and warn user
                 context.job_queue.run_once(del_msg, 600, data=sent_msg.message_id, chat_id=update.effective_chat.id)
                 await update.message.reply_text("⚠️ Content will disappear in 10 minutes.")
             else:
+                # FAILURE
                 await update.message.reply_text("❌ Error: File is deleted or invalid.")
         else:
             try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
@@ -601,6 +607,7 @@ async def guide_show(update, context):
             
     except Exception as e:
         logger.error(f"Guide Error: {e}")
+        # Only show system error if we didn't handle it in the inner logic
         await update.message.reply_text("❌ System Error. Try again.")
     return U_GUIDE_SELECT
 
@@ -647,7 +654,6 @@ def main():
     
     async def init(): 
         await col_vaults.create_index("key", unique=True)
-        # Create Index for faster searching
         await col_guides.create_index([("name", "text")]) 
     asyncio.get_event_loop().run_until_complete(init())
 
@@ -688,10 +694,10 @@ def main():
             UPD_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_upd_desc)],
             UPD_ADD_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_upd_link), CallbackQueryHandler(upd_router, pattern="^a_upd$")],
             UPD_DEL_LINK: [CallbackQueryHandler(del_upd_link, pattern="^upd_del_"), CallbackQueryHandler(upd_router, pattern="^a_upd$")],
-            U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), guide_show)], 
-            U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), vault_select_sub)],
-            V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
-            SEARCH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, perform_search)],
+            U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), guide_show), CallbackQueryHandler(user_router)], 
+            U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), vault_select_sub), CallbackQueryHandler(user_router)],
+            V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check), CallbackQueryHandler(user_router)], 
+            SEARCH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, perform_search), CallbackQueryHandler(user_router)],
             ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
         fallbacks=global_handlers,
