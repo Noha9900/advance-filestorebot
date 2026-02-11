@@ -22,7 +22,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 MONGO_URL = os.getenv("MONGO_URL")
 PORT = int(os.getenv("PORT", "8080"))
 
-# Production DB Connection
+# --- DATABASE ---
 client = AsyncIOMotorClient(
     MONGO_URL, 
     maxPoolSize=10, 
@@ -42,7 +42,7 @@ col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"
  UPD_MENU, UPD_DESC, UPD_ADD_LINK, UPD_DEL_LINK,
  SEARCH_STATE) = range(29)
 
-# --- SAFETY HELPER ---
+# --- HELPERS ---
 def get_file_info(message):
     if message.animation: return message.animation.file_id, "animation"
     if message.video: return message.video.file_id, "video"
@@ -50,7 +50,6 @@ def get_file_info(message):
     if message.document: return message.document.file_id, "document"
     return None, None
 
-# --- UTILS ---
 async def del_msg(context: ContextTypes.DEFAULT_TYPE):
     try: await context.bot.delete_message(chat_id=context.job.chat_id, message_id=context.job.data)
     except: pass
@@ -61,7 +60,7 @@ async def get_settings():
     u = await col_settings.find_one({"type": "updates"}) or {"desc": "Check our channels!", "links": []}
     return w, a, u
 
-# --- USER SIDE ---
+# --- USER START ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() 
     w, _, _ = await get_settings()
@@ -74,37 +73,31 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     markup = InlineKeyboardMarkup(kb)
     
-    # Message / Photo Handler
     if update.message:
         if w.get("photo"):
             msg = await update.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
         else:
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
-        # Delete start message after 60s
         context.job_queue.run_once(del_msg, 60, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
-        # Callback Handler (Back Button Logic)
-        query = update.callback_query
         try:
             if w.get("photo"):
-                if query.message.photo:
-                    await query.edit_message_media(media=InputMediaPhoto(media=w["photo"], caption=w["text"]), reply_markup=markup)
+                if update.callback_query.message.photo:
+                    await update.callback_query.edit_message_media(media=InputMediaPhoto(media=w["photo"], caption=w["text"]), reply_markup=markup)
                 else:
-                    await query.message.delete()
-                    await query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
+                    await update.callback_query.message.delete()
+                    await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
             else:
-                if query.message.photo:
-                    await query.message.delete()
-                    await query.message.reply_text(w["text"], reply_markup=markup)
+                if update.callback_query.message.photo:
+                    await update.callback_query.message.delete()
+                    await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
                 else:
-                    await query.edit_message_text(w["text"], reply_markup=markup)
+                    await update.callback_query.edit_message_text(w["text"], reply_markup=markup)
         except:
-            # Absolute Fail-safe
-            try: await query.message.delete()
+            try: await update.callback_query.message.delete()
             except: pass
-            if w.get("photo"): await query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
-            else: await query.message.reply_text(w["text"], reply_markup=markup)
-
+            if w.get("photo"): await update.callback_query.message.reply_photo(w["photo"], caption=w["text"], reply_markup=markup)
+            else: await update.callback_query.message.reply_text(w["text"], reply_markup=markup)
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -112,27 +105,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancelled. Type /start.")
     return ConversationHandler.END
 
-# --- MAIN ROUTER ---
+# --- USER ROUTER ---
 async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
     if query.data == "main": return await start(update, context)
 
     # --- UPDATES ---
     if query.data == "u_updates":
         _, _, u = await get_settings()
-        txt = f"📢 <b>UPDATES</b>\n\n{html.escape(u.get('desc', 'Check here for updates!'))}\n\n"
-        
+        txt = f"📢 <b>UPDATES</b>\n\n{html.escape(str(u.get('desc', 'Check our channels!')))}\n\n"
         if u.get('links'):
             txt += "👇 <b>Join Here:</b>\n"
             for link in u['links']:
-                txt += f"• {html.escape(link.get('name', 'Channel'))} - <a href='{link.get('url', '')}'><b>Click Me</b></a>\n"
+                txt += f"• {html.escape(str(link.get('name', 'Channel')))} - <a href='{link.get('url', '')}'><b>Click Me</b></a>\n"
         else:
             txt += "No updates yet."
-
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="main")]]
-        
         if query.message.photo:
             await query.message.delete()
             await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
@@ -140,7 +129,7 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb), disable_web_page_preview=True)
         return ConversationHandler.END
 
-    # --- ADULT STREAM ---
+    # --- ADULT ---
     if query.data.startswith("u_ad"):
         page = int(query.data.split("_")[-1]) if "_" in query.data else 0
         _, ad, _ = await get_settings()
@@ -156,7 +145,6 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if nav: kb.append(nav)
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         markup = InlineKeyboardMarkup(kb)
-        
         try:
             if ad.get("photo"):
                 if query.message.photo:
@@ -184,7 +172,6 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         LIMIT = 50
         skip = page * LIMIT
         
-        # Determine Search or Normal
         search_query = context.user_data.get("search_query")
         
         if search_query:
@@ -201,14 +188,13 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not items:
             txt = header + "❌ No content found."
         else:
-            txt = header + "Reply with <b>Number</b> to watch:\n\n"
+            txt = header + "Reply with <b>Number</b> to watch:\n(Type text to search)\n\n"
             for i, item in enumerate(items):
-                # Search = Local Numbering (1,2,3), Normal = Global (51,52,53)
                 if search_query:
                     display_num = i + 1 
                 else:
                     display_num = skip + i + 1
-                txt += f"<b>{display_num}.</b> {html.escape(item.get('name', 'Unknown'))}\n"
+                txt += f"<b>{display_num}.</b> {html.escape(str(item.get('name', 'Unknown')))}\n"
 
         nav_kb = []
         if page > 0: nav_kb.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list_{g_type}_{page-1}"))
@@ -216,12 +202,9 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         kb = []
         if nav_kb: kb.append(nav_kb)
-        kb.append([InlineKeyboardButton("🔍 Search", callback_data=f"search_{g_type}")])
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         
         context.user_data["view_type"] = g_type
-        
-        # Clear search query if we navigated back to normal list via button
         if not query.data.startswith("list_") and "search_query" in context.user_data:
              del context.user_data["search_query"]
 
@@ -234,16 +217,6 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
              await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
         return U_GUIDE_SELECT
-
-    # --- SEARCH TRIGGER ---
-    elif query.data.startswith("search_"):
-        g_type = query.data.split("_")[1]
-        context.user_data["search_type"] = g_type
-        # Clear previous search query to start fresh
-        if "search_query" in context.user_data: del context.user_data["search_query"]
-        
-        await query.edit_message_text(f"🔍 <b>Search {g_type.upper()}</b>\n\nSend the name you are looking for:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="main")]]))
-        return SEARCH_STATE
 
     # --- VAULT FOLDERS ---
     elif query.data == "u_vault_folders":
@@ -269,13 +242,12 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- SEARCH HANDLER ---
 async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.message.text
-    g_type = context.user_data.get("search_type")
+    # Determine type from previous state or default to anime
+    g_type = context.user_data.get("view_type", "anime") 
     
-    # Store query and trigger list view
     context.user_data["search_query"] = query_text
     context.user_data["view_type"] = g_type 
     
-    # Manually trigger the list logic
     LIMIT = 50
     regex_pattern = re.escape(query_text)
     db_query = {"type": g_type, "name": {"$regex": regex_pattern, "$options": "i"}}
@@ -289,9 +261,7 @@ async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         txt += "Reply with the <b>Number</b> to watch:\n\n"
         for i, item in enumerate(items):
-            # In Search, numbering is 1-N locally
-            txt += f"<b>{i+1}.</b> {html.escape(item['name'])}\n"
-            
+            txt += f"<b>{i+1}.</b> {html.escape(str(item['name']))}\n"
         kb = [[InlineKeyboardButton("🔙 Back to List", callback_data=f"list_{g_type}_0")]]
 
     await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
@@ -521,7 +491,7 @@ async def vault_key_check(update, context):
     else: await update.message.reply_text("❌ Wrong Key")
     return ConversationHandler.END
 
-# --- GUIDE SHOW (BUG FIXED) ---
+# --- GUIDE SHOW (FINAL FIX: NO SYSTEM ERROR ON SUCCESS) ---
 async def guide_show(update, context):
     try:
         view_type = context.user_data.get("view_type")
@@ -529,6 +499,11 @@ async def guide_show(update, context):
             await update.message.reply_text("❌ Session expired. Click buttons again.")
             return ConversationHandler.END
 
+        # 1. CHECK IF INPUT IS TEXT (SEARCH)
+        if not update.message.text.isdigit():
+             return await perform_search(update, context)
+
+        # 2. HANDLE NUMBER SELECTION
         try:
             user_input = int(update.message.text)
             search_query = context.user_data.get("search_query")
@@ -545,7 +520,7 @@ async def guide_show(update, context):
                 target_idx = 0 
 
         except ValueError:
-            await update.message.reply_text("❌ Send a valid number.")
+            await update.message.reply_text("❌ Send a valid number or text to search.")
             return U_GUIDE_SELECT
 
         msg = await update.message.reply_text("⏳ Processing...")
@@ -553,10 +528,10 @@ async def guide_show(update, context):
         if items and 0 <= target_idx < len(items):
             item = items[target_idx]
             
-            # --- SAFE DATA EXTRACTION ---
-            safe_name = html.escape(item.get('name', 'Unknown'))
-            safe_desc = html.escape(item.get('desc', ''))
-            chan_name = html.escape(item.get('chan_name', 'Channel'))
+            # SAFE DATA EXTRACTION (STR + ESCAPE)
+            safe_name = html.escape(str(item.get('name', 'Unknown')))
+            safe_desc = html.escape(str(item.get('desc', '')))
+            chan_name = html.escape(str(item.get('chan_name', 'Channel')))
             chan_link = item.get('chan_link', '')
             watch_link = item.get('link', '') 
             
@@ -573,7 +548,7 @@ async def guide_show(update, context):
             success = False
             sent_msg = None
             
-            # --- SENDING LOGIC (NO ERROR POPUP ON SUCCESS) ---
+            # --- ROBUST SENDING LOGIC ---
             try:
                 if mtype == "video": sent_msg = await update.message.reply_video(fid, caption=caption)
                 elif mtype == "animation": sent_msg = await update.message.reply_animation(fid, caption=caption)
@@ -581,24 +556,24 @@ async def guide_show(update, context):
                 else: sent_msg = await update.message.reply_photo(fid, caption=caption)
                 success = True
             except Exception:
+                # Fallback to Document if type failed
                 try:
-                    sent_msg = await update.message.reply_video(fid, caption=caption)
+                    sent_msg = await update.message.reply_document(fid, caption=caption)
                     success = True
-                except:
-                    try:
-                        sent_msg = await update.message.reply_document(fid, caption=caption)
-                        success = True
-                    except: pass
+                except: pass
             
+            # Delete "Processing" message
             try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
             except: pass
             
             if success and sent_msg:
-                # SUCCESS: Schedule delete and warn user
+                # SCHEDULE DELETE (10 MIN)
                 context.job_queue.run_once(del_msg, 600, data=sent_msg.message_id, chat_id=update.effective_chat.id)
+                # SEND SEPARATE WARNING
                 await update.message.reply_text("⚠️ Content will disappear in 10 minutes.")
+                # EXIT FUNCTION TO PREVENT ERROR FALLTHROUGH
+                return U_GUIDE_SELECT
             else:
-                # FAILURE
                 await update.message.reply_text("❌ Error: File is deleted or invalid.")
         else:
             try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
@@ -607,7 +582,6 @@ async def guide_show(update, context):
             
     except Exception as e:
         logger.error(f"Guide Error: {e}")
-        # Only show system error if we didn't handle it in the inner logic
         await update.message.reply_text("❌ System Error. Try again.")
     return U_GUIDE_SELECT
 
@@ -694,7 +668,8 @@ def main():
             UPD_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_upd_desc)],
             UPD_ADD_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_upd_link), CallbackQueryHandler(upd_router, pattern="^a_upd$")],
             UPD_DEL_LINK: [CallbackQueryHandler(del_upd_link, pattern="^upd_del_"), CallbackQueryHandler(upd_router, pattern="^a_upd$")],
-            U_GUIDE_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), guide_show), CallbackQueryHandler(user_router)], 
+            # FIXED: guide_show handles both numbers AND text for search
+            U_GUIDE_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, guide_show), CallbackQueryHandler(user_router)], 
             U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), vault_select_sub), CallbackQueryHandler(user_router)],
             V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check), CallbackQueryHandler(user_router)], 
             SEARCH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, perform_search), CallbackQueryHandler(user_router)],
