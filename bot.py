@@ -1,4 +1,4 @@
-import os, asyncio, secrets, logging, html
+import os, asyncio, secrets, logging, html, math
 from datetime import datetime
 from flask import Flask
 from threading import Thread
@@ -39,7 +39,8 @@ col_settings, col_guides, col_vaults = db["settings"], db["guides"], db["vaults"
  MOV_NA, MOV_ME, MOV_DE, MOV_CHAN, MOV_LI, 
  A_V_FOLD, A_V_SUB, A_V_POST, A_V_DESC, A_V_FILES, 
  V_KEY_INPUT, U_GUIDE_SELECT, U_V_SUB_SELECT, ADM_DEL_SELECT,
- UPD_MENU, UPD_DESC, UPD_ADD_LINK, UPD_DEL_LINK) = range(28)
+ UPD_MENU, UPD_DESC, UPD_ADD_LINK, UPD_DEL_LINK,
+ SEARCH_STATE) = range(29) # Added SEARCH_STATE
 
 # --- SAFETY HELPER ---
 def get_file_info(message):
@@ -69,10 +70,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear() 
     w, _, _ = await get_settings()
     
-    # NEW: Added "Updates Channel" button
     kb = [
         [InlineKeyboardButton("Adult Stream 🔥", callback_data="u_ad_0")], 
-        [InlineKeyboardButton("Anime Guide 🎌", callback_data="u_list_anime"), InlineKeyboardButton("Movie Guide 🎬", callback_data="u_list_movies")],
+        [InlineKeyboardButton("Anime Guide 🎌", callback_data="list_anime_0"), InlineKeyboardButton("Movie Guide 🎬", callback_data="list_movies_0")],
         [InlineKeyboardButton("Secret Vault 🔒", callback_data="u_vault_folders")],
         [InlineKeyboardButton("Updates Channel 📢", callback_data="u_updates")]
     ]
@@ -85,7 +85,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = await update.message.reply_text(w["text"], reply_markup=markup)
         context.job_queue.run_once(del_msg, 60, data=msg.message_id, chat_id=update.effective_chat.id)
     else:
-        # Smart Media Swap Logic
+        # Smart Media Swap Logic to prevent errors
         try:
             if w.get("photo"):
                 if update.callback_query.message.photo:
@@ -127,13 +127,11 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.data == "u_updates":
         _, _, u = await get_settings()
         
-        # Build formatting: Name - Click Me (Bold Link)
         txt = f"📢 <b>UPDATES</b>\n\n{html.escape(u['desc'])}\n\n"
         
         if u['links']:
             txt += "👇 <b>Join Here:</b>\n"
             for link in u['links']:
-                # SAFE HTML FORMATTING
                 txt += f"• {html.escape(link['name'])} - <a href='{link['url']}'><b>Click Me</b></a>\n"
         else:
             txt += "No updates yet."
@@ -189,20 +187,77 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text(ad["text"], reply_markup=markup)
         return ConversationHandler.END
 
-    # --- LISTS (ANIME/MOVIE) ---
-    elif "u_list_" in query.data:
-        g_type = query.data.split("_")[-1]
-        items = await col_guides.find({"type": g_type}).sort("_id", 1).to_list(100)
+    # --- LISTS (ANIME/MOVIE) WITH PAGINATION ---
+    elif query.data.startswith("list_"):
+        parts = query.data.split("_")
+        g_type = parts[1] # anime or movies
+        page = int(parts[2])
         
-        txt = f"📖 <b>{g_type.upper()} LIST</b>\n\n"
-        if not items: txt += "No content added yet."
-        else: txt += "Reply with the <b>Number</b> to watch:\n\n"
-        for i, x in enumerate(items): txt += f"{i+1}. {x['name']}\n"
+        LIMIT = 50
+        skip = page * LIMIT
+        
+        # Determine context - Search Result or Full List?
+        search_query = context.user_data.get("search_query")
+        
+        if search_query:
+            # SEARCH MODE
+            db_query = {"type": g_type, "name": {"$regex": search_query, "$options": "i"}}
+            total_count = await col_guides.count_documents(db_query)
+            items = await col_guides.find(db_query).sort("_id", 1).skip(skip).limit(LIMIT).to_list(LIMIT)
+            header = f"🔍 <b>SEARCH RESULTS: {search_query}</b>\n\n"
+        else:
+            # NORMAL LIST MODE
+            total_count = await col_guides.count_documents({"type": g_type})
+            items = await col_guides.find({"type": g_type}).sort("_id", 1).skip(skip).limit(LIMIT).to_list(LIMIT)
+            header = f"📖 <b>{g_type.upper()} LIST</b> (Page {page+1})\n\n"
+
+        if not items:
+            txt = header + "No content found."
+        else:
+            txt = header + "Reply with the <b>Number</b> to watch:\n\n"
+            for i, item in enumerate(items):
+                # Calculate Absolute Number: (Page * Limit) + Index + 1
+                abs_num = skip + i + 1
+                txt += f"<b>{abs_num}.</b> {html.escape(item['name'])}\n"
+
+        # Navigation Buttons
+        nav_kb = []
+        if page > 0:
+            nav_kb.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list_{g_type}_{page-1}"))
+        
+        # Check if there is a next page
+        if skip + LIMIT < total_count:
+            nav_kb.append(InlineKeyboardButton("Next ➡️", callback_data=f"list_{g_type}_{page+1}"))
+            
+        kb = []
+        if nav_kb: kb.append(nav_kb)
+        
+        # Add Search and Back buttons
+        kb.append([InlineKeyboardButton("🔍 Search", callback_data=f"search_{g_type}")])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="main")])
         
         context.user_data["view_type"] = g_type
-        await query.message.delete()
-        await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main")]]))
+        # If searching, we keep the query in context. If normal list, ensure query is cleared if we came from main
+        if not query.data.startswith("list_") and "search_query" in context.user_data:
+             del context.user_data["search_query"]
+
+        try:
+            if query.message.photo:
+                await query.message.delete()
+                await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+            else:
+                await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+        except:
+             await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+             
         return U_GUIDE_SELECT
+
+    # --- SEARCH TRIGGER ---
+    elif query.data.startswith("search_"):
+        g_type = query.data.split("_")[1]
+        context.user_data["search_type"] = g_type
+        await query.edit_message_text(f"🔍 <b>Search {g_type.upper()}</b>\n\nSend the name you are looking for:")
+        return SEARCH_STATE
 
     # --- VAULT FOLDERS ---
     elif query.data == "u_vault_folders":
@@ -227,6 +282,39 @@ async def user_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.delete()
         await query.message.reply_text(txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="u_vault_folders")]]))
         return U_V_SUB_SELECT
+
+# --- SEARCH HANDLER ---
+async def perform_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query_text = update.message.text
+    g_type = context.user_data.get("search_type")
+    
+    # Store query for pagination
+    context.user_data["search_query"] = query_text
+    context.user_data["view_type"] = g_type # Ensure view type is set for selection
+    
+    # Trigger the list view starting at page 0, but now filtered
+    # We essentially simulate the callback logic but internally
+    
+    LIMIT = 50
+    items = await col_guides.find({"type": g_type, "name": {"$regex": query_text, "$options": "i"}}).sort("_id", 1).limit(LIMIT).to_list(LIMIT)
+    total_count = await col_guides.count_documents({"type": g_type, "name": {"$regex": query_text, "$options": "i"}})
+    
+    txt = f"🔍 <b>RESULTS FOR: '{query_text}'</b>\n\n"
+    if not items:
+        txt += "❌ No matches found."
+        kb = [[InlineKeyboardButton("🔙 Back to List", callback_data=f"list_{g_type}_0")]]
+    else:
+        txt += "Reply with the <b>Number</b> to watch:\n\n"
+        for i, item in enumerate(items):
+            txt += f"<b>{i+1}.</b> {html.escape(item['name'])}\n"
+            
+        kb = []
+        if total_count > LIMIT:
+             kb.append([InlineKeyboardButton("Next ➡️", callback_data=f"list_{g_type}_1")])
+        kb.append([InlineKeyboardButton("🔙 Back to List", callback_data=f"list_{g_type}_0")])
+
+    await update.message.reply_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+    return U_GUIDE_SELECT
 
 # --- ADMIN PANEL ---
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -466,7 +554,6 @@ async def vault_key_check(update, context):
             except Exception:
                 try: 
                     msg = await update.message.reply_document(fid)
-                    # FIXED: 600 Seconds = 10 Minutes
                     context.job_queue.run_once(del_msg, 600, data=msg.message_id, chat_id=update.effective_chat.id)
                 except: pass 
                 
@@ -484,16 +571,35 @@ async def guide_show(update, context):
             return ConversationHandler.END
 
         try:
-            idx = int(update.message.text) - 1
+            # Handle Pagination Logic for Selection
+            user_input = int(update.message.text)
+            
+            # Determine if this was a Search Result or a Normal List
+            search_query = context.user_data.get("search_query")
+            
+            if search_query:
+                # If searching, we fetch the specific item from the search results
+                # In search, items are numbered 1 to N relative to the results, NOT paginated globally
+                # So we simply fetch the list again and pick the index (user_input - 1)
+                items = await col_guides.find({"type": view_type, "name": {"$regex": search_query, "$options": "i"}}).sort("_id", 1).limit(50).to_list(50)
+                target_idx = user_input - 1
+            else:
+                # If Normal List, user input represents global number (e.g. 52)
+                # We need to find the item at absolute index (52 - 1 = 51)
+                target_idx = user_input - 1
+                items = await col_guides.find({"type": view_type}).sort("_id", 1).skip(target_idx).limit(1).to_list(1)
+                # If found, items will contain 1 element at index 0. We reset target_idx to 0 for the next step.
+                if items:
+                    target_idx = 0 
+
         except ValueError:
             await update.message.reply_text("❌ Send a valid number.")
             return U_GUIDE_SELECT
 
         msg = await update.message.reply_text("⏳ Processing...")
-        items = await col_guides.find({"type": view_type}).sort("_id", 1).to_list(100)
         
-        if 0 <= idx < len(items):
-            item = items[idx]
+        if 0 <= target_idx < len(items):
+            item = items[target_idx]
             
             # --- INFO CONSTRUCTION ---
             safe_name = html.escape(item['name'])
@@ -502,7 +608,7 @@ async def guide_show(update, context):
             # Additional Fields (Channel & Watch)
             chan_name = html.escape(item.get('chan_name', 'Channel'))
             chan_link = item.get('chan_link', '')
-            watch_link = item.get('link', '') # Stored in 'link' field from save_g_final
+            watch_link = item.get('link', '') 
             
             # Build Caption
             caption = f"⭐ <b>{safe_name}</b>\n\n{safe_desc}\n\n"
@@ -516,7 +622,7 @@ async def guide_show(update, context):
             success = False
             sent_msg = None
             
-            # Sending Attempt
+            # UNIVERSAL SENDER ENGINE
             try:
                 if mtype == "video": sent_msg = await update.message.reply_video(fid, caption=caption)
                 elif mtype == "animation": sent_msg = await update.message.reply_animation(fid, caption=caption)
@@ -526,31 +632,34 @@ async def guide_show(update, context):
             except Exception as e:
                 logger.error(f"Attempt 1 failed: {e}")
                 
-            # Fallback 1: Video
+            # Fallback 1: Force Video
             if not success:
                 try:
                     sent_msg = await update.message.reply_video(fid, caption=caption)
                     success = True
                 except: pass
                 
-            # Fallback 2: Document
+            # Fallback 2: Force Document (The Magic Fix for "File Invalid")
             if not success:
                 try:
                     sent_msg = await update.message.reply_document(fid, caption=caption)
                     success = True
                 except: pass
             
+            # Cleanup Loading Message
             try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
             except: pass
             
             if success and sent_msg:
-                # FIXED: 600 Seconds = 10 Minutes Auto-Delete
+                # 600 Seconds = 10 Minutes Auto-Delete
                 context.job_queue.run_once(del_msg, 600, data=sent_msg.message_id, chat_id=update.effective_chat.id)
                 await update.message.reply_text("⚠️ Content will disappear in 10 minutes.")
             else:
                 await update.message.reply_text("❌ Error: File is possibly deleted or invalid.")
         else: 
-            await update.message.reply_text(f"❌ Invalid Number. 1-{len(items)}")
+            try: await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=msg.message_id)
+            except: pass
+            await update.message.reply_text(f"❌ Invalid Number.")
             
     except Exception as e:
         logger.error(f"Critical Guide Error: {e}")
@@ -598,7 +707,10 @@ def main():
     defaults = Defaults(parse_mode=ParseMode.HTML)
     app = Application.builder().token(TOKEN).defaults(defaults).build()
     
-    async def init(): await col_vaults.create_index("key", unique=True)
+    async def init(): 
+        await col_vaults.create_index("key", unique=True)
+        # INDEX FOR FAST SEARCH
+        await col_guides.create_index([("name", "text")]) 
     asyncio.get_event_loop().run_until_complete(init())
 
     global_handlers = [
@@ -609,6 +721,8 @@ def main():
         CallbackQueryHandler(admin_panel, pattern="^a_panel_back$"),
         CallbackQueryHandler(user_router, pattern="^u_"),
         CallbackQueryHandler(user_router, pattern="^vfold_"),
+        CallbackQueryHandler(user_router, pattern="^list_"), # PAGINATION HANDLER
+        CallbackQueryHandler(user_router, pattern="^search_"), # SEARCH BUTTON HANDLER
         CallbackQueryHandler(admin_router, pattern="^a_"),
         CallbackQueryHandler(upd_router, pattern="^upd_"),
         CallbackQueryHandler(del_upd_link, pattern="^upd_del_")
@@ -651,6 +765,9 @@ def main():
             U_V_SUB_SELECT: [MessageHandler(filters.Regex(r'^\s*\d+\s*$'), vault_select_sub)],
             V_KEY_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, vault_key_check)], 
             
+            # Search Input
+            SEARCH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, perform_search)],
+
             # Admin Delete
             ADM_DEL_SELECT: [CallbackQueryHandler(admin_del_process, pattern="^del_"), CallbackQueryHandler(admin_confirm_delete, pattern="^confirm_del_"), CallbackQueryHandler(admin_del_menu, pattern="^a_back$"), CallbackQueryHandler(admin_del_menu, pattern="^a_del$")],
         },
